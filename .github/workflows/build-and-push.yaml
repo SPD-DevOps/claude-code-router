@@ -1,0 +1,25 @@
+name: "3 - [K8S][PRD] Build and Update Image Tag"
+
+on:
+  push:
+    branches:
+      - "main"
+
+  workflow_dispatch:
+
+jobs:
+  publish-docker:
+    uses: ./.github/workflows/build.yaml
+    with:
+      environment: prd
+      run-environment: production
+    secrets: inherit
+
+  update-image-tag:
+    uses: ./.github/workflows/update-tag.yaml
+    needs:
+      - publish-docker
+    with:
+      environment: prd
+      image-tag: ${{ needs.publish-docker.outputs.image-tag }}
+    secrets: inherit

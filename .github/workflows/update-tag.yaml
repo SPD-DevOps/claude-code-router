@@ -1,0 +1,45 @@
+name: Update Image Tag
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: 'Set environment'
+        required: true
+        type: string
+      runs-on:
+        required: false
+        type: string
+        default: ubuntu-latest
+      image-tag:
+        required: true
+        type: string
+      property-path:
+        required: false
+        type: string
+        default: 'image.tag'
+
+jobs:
+  update-tag:
+    name: Update
+    runs-on: ${{ inputs.runs-on }}
+    steps:
+      - name: Checkout Target Repository
+        uses: actions/checkout@v3
+        with:
+          repository: SPD-DevOps/speedio-k8s-devops-infra
+          path: infra
+          token: ${{ secrets.GH_PAT }}
+          ref: main
+
+      - name: Update Image Version in HelmChart values.yaml
+        uses: fjogeleit/yaml-update-action@main
+        with:
+          valueFile: k8s/charts/${{ inputs.environment }}/${{ github.event.repository.name }}/values.yaml
+          propertyPath: ${{ inputs.property-path }}
+          value: ${{ inputs.image-tag }}
+          repository: SPD-DevOps/speedio-k8s-devops-infra
+          branch: main
+          message: 'Update Image Version to ${{ inputs.image-tag }}'
+          token: ${{ secrets.GH_PAT }}
+          workDir: infra
