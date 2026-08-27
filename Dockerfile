@@ -14,6 +14,10 @@ RUN npm ci
 COPY . .
 RUN npm run build:docker
 
+FROM ${NODE_IMAGE} AS cli
+RUN npm install -g --prefix /opt/ccr-cli @musistudio/claude-code-router \
+  && npm cache clean --force
+
 FROM ${NODE_IMAGE} AS production-deps
 WORKDIR /app
 ENV NODE_ENV=production
@@ -60,10 +64,12 @@ COPY --from=production-deps /app/node_modules node_modules
 
 COPY --from=build /app/packages/core/dist packages/core/dist
 COPY --from=build /app/packages/ui/dist/renderer /usr/share/nginx/html
+COPY --from=cli /opt/ccr-cli /opt/ccr-cli
 COPY docker/entrypoint.sh /usr/local/bin/ccr-docker-entrypoint
 COPY docker/pm2.config.cjs docker/pm2.config.cjs
 
-RUN chmod +x /usr/local/bin/ccr-docker-entrypoint \
+RUN ln -s /opt/ccr-cli/bin/ccr /usr/local/bin/ccr \
+  && chmod +x /usr/local/bin/ccr-docker-entrypoint \
   && mkdir -p /data /run/nginx /var/lib/nginx /var/log/nginx
 
 VOLUME ["/data"]
