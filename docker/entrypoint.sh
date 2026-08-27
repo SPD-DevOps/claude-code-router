@@ -32,12 +32,29 @@ export CCR_WEB_AUTH_TOKEN
 export CCR_WEB_AUTH_TOKEN_QUERY
 export CCR_WEB_HOST
 export CCR_WEB_PORT
+export CCR_ENABLE_SSH="${CCR_ENABLE_SSH:-0}"
+export CCR_SSH_PORT="${CCR_SSH_PORT:-22}"
 
 CONFIG_DIR="${HOME}/.claude-code-router"
 CONFIG_FILE="${CONFIG_DIR}/config.json"
 APP_CONFIG_DB_FILE="${CONFIG_DIR}/config.sqlite"
 
 mkdir -p "${CONFIG_DIR}" "${CONFIG_DIR}/app-data" /run/nginx /var/lib/nginx /var/log/nginx
+
+if [ "${CCR_ENABLE_SSH:-0}" = "1" ] || [ "${CCR_ENABLE_SSH:-0}" = "true" ]; then
+  SSH_HOST_KEY_DIR="${HOME}/.ssh_host_keys"
+  mkdir -p "${SSH_HOST_KEY_DIR}"
+  [ -f "${SSH_HOST_KEY_DIR}/dropbear_ed25519_host_key" ] || dropbearkey -t ed25519 -f "${SSH_HOST_KEY_DIR}/dropbear_ed25519_host_key" >/dev/null
+  [ -f "${SSH_HOST_KEY_DIR}/dropbear_rsa_host_key" ] || dropbearkey -t rsa -f "${SSH_HOST_KEY_DIR}/dropbear_rsa_host_key" >/dev/null
+
+  mkdir -p /root/.ssh
+  chmod 700 /root/.ssh
+  : > /root/.ssh/authorized_keys
+  if [ -n "${SSH_AUTHORIZED_KEY:-}" ]; then
+    printf '%s\n' "${SSH_AUTHORIZED_KEY}" > /root/.ssh/authorized_keys
+  fi
+  chmod 600 /root/.ssh/authorized_keys
+fi
 
 if [ "${CCR_DOCKER_INIT_CONFIG:-1}" != "0" ] && [ ! -f "${CONFIG_FILE}" ] && [ ! -f "${APP_CONFIG_DB_FILE}" ]; then
   node - <<'NODE'

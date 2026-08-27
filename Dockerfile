@@ -38,7 +38,7 @@ ENV NODE_ENV=production \
 WORKDIR /app
 
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates libstdc++6 nginx \
+  && apt-get install -y --no-install-recommends ca-certificates libstdc++6 nginx dropbear-bin \
   && rm -rf /var/lib/apt/lists/* \
   && rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf \
   && rm -rf \
@@ -67,7 +67,7 @@ RUN chmod +x /usr/local/bin/ccr-docker-entrypoint \
   && mkdir -p /data /run/nginx /var/lib/nginx /var/log/nginx
 
 VOLUME ["/data"]
-EXPOSE 8080
+EXPOSE 8080 22
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:' + (process.env.CCR_NGINX_PORT || '8080') + '/').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
