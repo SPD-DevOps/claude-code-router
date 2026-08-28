@@ -34,6 +34,7 @@ export CCR_WEB_HOST
 export CCR_WEB_PORT
 export CCR_ENABLE_SSH="${CCR_ENABLE_SSH:-0}"
 export CCR_SSH_PORT="${CCR_SSH_PORT:-22}"
+export CCR_ENABLE_UI_AUTH="${CCR_ENABLE_UI_AUTH:-1}"
 
 CONFIG_DIR="${HOME}/.claude-code-router"
 CONFIG_FILE="${CONFIG_DIR}/config.json"
@@ -54,6 +55,47 @@ if [ "${CCR_ENABLE_SSH:-0}" = "1" ] || [ "${CCR_ENABLE_SSH:-0}" = "true" ]; then
     printf '%s\n' "${SSH_AUTHORIZED_KEY}" > /root/.ssh/authorized_keys
   fi
   chmod 600 /root/.ssh/authorized_keys
+fi
+
+# UI Basic Auth: regenerated on every boot so it survives pod restarts/redeploys
+# (nginx.conf itself is not on the PVC, only ${HOME}/.ccr-htpasswd is).
+HTPASSWD_FILE="${HOME}/.ccr-htpasswd"
+if [ "${CCR_ENABLE_UI_AUTH}" = "1" ] || [ "${CCR_ENABLE_UI_AUTH}" = "true" ]; then
+  if [ ! -f "${HTPASSWD_FILE}" ] && [ -n "${CCR_UI_AUTH_HTPASSWD:-}" ]; then
+    printf '%s\n' "${CCR_UI_AUTH_HTPASSWD}" > "${HTPASSWD_FILE}"
+    chmod 600 "${HTPASSWD_FILE}"
+  fi
+
+  if [ -f "${HTPASSWD_FILE}" ]; then
+    cat > /etc/nginx/conf.d/00-ui-auth.conf <<EOF
+geo \$ccr_probe_net {
+  default 0;
+  10.64.0.0/16 1;
+  127.0.0.1/32 1;
+}
+map \$http_user_agent \$ccr_probe_ua {
+  default 0;
+  ~*^kube-probe/ 1;
+}
+map \$uri \$ccr_uri_publica {
+  default 0;
+  ~^/health\$ 1;
+  ~^/(v1|v1beta|mcp|messages|chat/completions|responses|interactions)(/|\$) 1;
+}
+map "\$ccr_uri_publica\$ccr_probe_net\$ccr_probe_ua" \$ccr_auth_realm {
+  default "CCR Speedio";
+  ~^1     off;
+  "011"   off;
+}
+auth_basic \$ccr_auth_realm;
+auth_basic_user_file ${HTPASSWD_FILE};
+EOF
+  else
+    rm -f /etc/nginx/conf.d/00-ui-auth.conf
+    echo "WARN: CCR_ENABLE_UI_AUTH=${CCR_ENABLE_UI_AUTH} mas ${HTPASSWD_FILE} nao existe e CCR_UI_AUTH_HTPASSWD nao foi definido - UI segue SEM Basic Auth" >&2
+  fi
+else
+  rm -f /etc/nginx/conf.d/00-ui-auth.conf
 fi
 
 if [ "${CCR_DOCKER_INIT_CONFIG:-1}" != "0" ] && [ ! -f "${CONFIG_FILE}" ] && [ ! -f "${APP_CONFIG_DB_FILE}" ]; then
