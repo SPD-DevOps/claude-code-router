@@ -33,6 +33,13 @@ const Database = require("better-sqlite3");
 const s3 = new S3Client({
   region,
   endpoint,
+  // Hetzner's Object Storage (Ceph RGW) doesn't handle the SDK's default
+  // flexible-checksum trailers well - surfaces as an opaque "UnknownError"
+  // on every request otherwise. forcePathStyle avoids relying on wildcard
+  // DNS for <bucket>.<endpoint> virtual-hosted addressing.
+  forcePathStyle: true,
+  requestChecksumCalculation: "WHEN_REQUIRED",
+  responseChecksumValidation: "WHEN_REQUIRED",
   credentials: {
     accessKeyId: process.env.AWS_ACCESS_KEY_ID,
     secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
