@@ -35,6 +35,7 @@ export CCR_WEB_PORT
 export CCR_ENABLE_SSH="${CCR_ENABLE_SSH:-0}"
 export CCR_SSH_PORT="${CCR_SSH_PORT:-22}"
 export CCR_ENABLE_UI_AUTH="${CCR_ENABLE_UI_AUTH:-1}"
+export CCR_ENABLE_LOG_EXPORT="${CCR_ENABLE_LOG_EXPORT:-0}"
 
 CONFIG_DIR="${HOME}/.claude-code-router"
 CONFIG_FILE="${CONFIG_DIR}/config.json"

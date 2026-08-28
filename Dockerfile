@@ -18,6 +18,11 @@ FROM ${NODE_IMAGE} AS cli
 RUN npm install -g --prefix /opt/ccr-cli @musistudio/claude-code-router \
   && npm cache clean --force
 
+FROM ${NODE_IMAGE} AS s3sdk
+WORKDIR /opt/ccr-s3-sdk
+RUN npm install @aws-sdk/client-s3 \
+  && npm cache clean --force
+
 FROM ${NODE_IMAGE} AS production-deps
 WORKDIR /app
 ENV NODE_ENV=production
@@ -37,7 +42,8 @@ ENV NODE_ENV=production \
     CCR_GATEWAY_PORT=3456 \
     CCR_GATEWAY_CORE_PORT=3457 \
     CCR_PUBLIC_HOST=127.0.0.1 \
-    CCR_PUBLIC_PORT=3458
+    CCR_PUBLIC_PORT=3458 \
+    NODE_PATH=/opt/ccr-s3-sdk/node_modules
 
 WORKDIR /app
 
@@ -65,8 +71,10 @@ COPY --from=production-deps /app/node_modules node_modules
 COPY --from=build /app/packages/core/dist packages/core/dist
 COPY --from=build /app/packages/ui/dist/renderer /usr/share/nginx/html
 COPY --from=cli /opt/ccr-cli /opt/ccr-cli
+COPY --from=s3sdk /opt/ccr-s3-sdk/node_modules /opt/ccr-s3-sdk/node_modules
 COPY docker/entrypoint.sh /usr/local/bin/ccr-docker-entrypoint
 COPY docker/pm2.config.cjs docker/pm2.config.cjs
+COPY docker/log-export.cjs docker/log-export.cjs
 
 RUN ln -s /opt/ccr-cli/bin/ccr /usr/local/bin/ccr \
   && chmod +x /usr/local/bin/ccr-docker-entrypoint \
