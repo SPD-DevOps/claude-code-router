@@ -63,10 +63,12 @@ HTPASSWD_FILE="${HOME}/.ccr-htpasswd"
 if [ "${CCR_ENABLE_UI_AUTH}" = "1" ] || [ "${CCR_ENABLE_UI_AUTH}" = "true" ]; then
   if [ ! -f "${HTPASSWD_FILE}" ] && [ -n "${CCR_UI_AUTH_HTPASSWD:-}" ]; then
     printf '%s\n' "${CCR_UI_AUTH_HTPASSWD}" > "${HTPASSWD_FILE}"
-    chmod 600 "${HTPASSWD_FILE}"
   fi
 
   if [ -f "${HTPASSWD_FILE}" ]; then
+    # nginx workers run as www-data (see docker/nginx base image config), not root,
+    # so the file must be world-readable for auth_basic_user_file to open it.
+    chmod 644 "${HTPASSWD_FILE}"
     cat > /etc/nginx/conf.d/00-ui-auth.conf <<EOF
 geo \$ccr_probe_net {
   default 0;
