@@ -671,3 +671,37 @@ test("model-chain fallback refreshes the routed model before core gateway resolu
     globalThis.fetch = originalFetch;
   }
 });
+
+test('429 quarantines an account across all models and never reuses an entirely quarantined pool', async () => {
+  const { recordProviderCredentialOutcome } = await import('@ccr/core/providers/credential-pool.ts');
+  const { providerCredentialInternalName } = await import('@ccr/core/providers/runtime-topology.ts');
+  const protocol = 'anthropic_messages';
+  const first = { id: 'primary', apiKey: 'first', priority: 0 };
+  const second = { id: 'secondary', apiKey: 'second', priority: 1 };
+  const provider = {
+    name: `Quarantine all models ${Date.now()}`,
+    credentials: [first, second],
+    capabilities: [{ baseUrl: 'https://api.anthropic.com', type: protocol }],
+    models: ['claude-sonnet-5', 'claude-opus-5', 'claude-haiku-4-5']
+  };
+  const config = { Providers: [provider], Router: { fallback: { mode: 'off', models: [], retryCount: 0 }, rules: [] }, virtualModelProfiles: [] };
+  function quarantine(credential) {
+    recordProviderCredentialOutcome(config, 'POST', {
+      logicalProvider: provider.name, credentialProtocol: protocol,
+      credentialChain: [providerCredentialInternalName(provider, protocol, credential)]
+    }, 429, new Headers());
+  }
+  function prepare(model) {
+    return prepareGatewayUpstreamAttemptForTest({
+      body: { model: `${provider.name}/${model}`, messages: [] }, config,
+      headers: {}, method: 'POST', path: '/v1/messages', routedModel: `${provider.name}/${model}`
+    });
+  }
+  quarantine(first);
+  for (const model of provider.models) {
+    const attempt = prepare(model);
+    assert.deepEqual(attempt.credentialIds, ['secondary']);
+  }
+  quarantine(second);
+  for (const model of provider.models) assert.throws(() => prepare(model), /All credentials.*quarantined/);
+});

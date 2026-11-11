@@ -59,5 +59,5 @@ test("upstream credential response identity takes precedence over the planned ch
   assert.equal(readProviderCredentialCooldown(provider, second)?.reason, "HTTP 429");
 
   recordProviderCredentialOutcome(config, "POST", attempt, 200, headers);
-  assert.equal(readProviderCredentialCooldown(provider, second), undefined);
+  assert.equal(readProviderCredentialCooldown(provider, second)?.reason, "HTTP 429");
 });

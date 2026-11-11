@@ -1,3 +1,6 @@
+import path from "node:path";
+import { resolveRuntimeConfigDir } from "@ccr/core/runtime/app-paths";
+import { CredentialQuarantineStore } from "@ccr/core/providers/credential-quarantine";
 import type { AppConfig, GatewayProviderConfig, ProviderCredentialConfig } from "@ccr/core/contracts/app";
 import { estimateLimitUsage, limitRules, readWindowCounter } from "@ccr/core/gateway/limits/window-limiter";
 import {
@@ -14,6 +17,7 @@ import {
 } from "@ccr/core/providers/runtime-topology";
 
 const providerCredentialCooldownMs = 60_000;
+const quarantine = new CredentialQuarantineStore(path.join(resolveRuntimeConfigDir(), "credential-quarantine.json"));
 const providerCredentialCooldowns = new Map<string, { reason: string; until: number }>();
 
 export function providerCredentialLimitState(
@@ -54,6 +58,11 @@ export function recordProviderCredentialOutcome(
   const credential = responseCredential ?? providerCredentialFromInternalName(provider, attempt.credentialChain[0]);
   if (!credential) return;
 
+  if (statusCode === 429) {
+    quarantine.quarantine(providerCredentialStateKey(provider, credential));
+    return;
+  }
+
   if (statusCode >= 200 && statusCode < 500 && statusCode !== 401 && statusCode !== 403 && statusCode !== 429) {
     incrementProviderCredentialCounters(provider, credential, estimateLimitUsage(method, attempt.body ?? Buffer.alloc(0)));
     clearProviderCredentialCooldown(provider, credential);
@@ -69,6 +78,8 @@ export function readProviderCredentialCooldown(
   credential: ProviderCredentialConfig
 ): { reason: string; until: number } | undefined {
   const key = providerCredentialStateKey(provider, credential);
+  const persistent = quarantine.read(key);
+  if (persistent) return persistent;
   const cooldown = providerCredentialCooldowns.get(key);
   if (!cooldown) return undefined;
   if (cooldown.until > Date.now()) return cooldown;
