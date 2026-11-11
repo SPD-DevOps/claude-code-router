@@ -235,6 +235,17 @@ export class UpstreamRequestError extends Error {
 }
 
 
+export class ProviderCredentialsQuarantinedError extends Error {
+  readonly providerName: string;
+
+  constructor(providerName: string) {
+    super(`All credentials for ${providerName} are quarantined after HTTP 429; retry after quarantine expires.`);
+    this.name = "ProviderCredentialsQuarantinedError";
+    this.providerName = providerName;
+  }
+}
+
+
 export const requireFromHere = createRequire(__filename);
 
 export const claudeCodeOauthBetaHeader = "anthropic-beta";
