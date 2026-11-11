@@ -94,3 +94,17 @@ suite. These are acceptance blockers until diagnosed or explicitly scoped by rev
 
 S3 usage/request-log exports alone are not complete credential/configuration backups.
 Never run a candidate against the live RWO volume concurrently with production.
+
+## Follow-up: diagnosed failures and fixes
+
+- The heap fixture bounded old-space but not young-generation space; Node/V8/architecture
+  defaults could make the 96 MiB fixture smaller than the heap cap. Also bound semi-space
+  to 4 MiB. The original assertion and fixture remain, and the memory regression now passes.
+- Three Desktop fixtures only set `CCR_DESKTOP_APP=1`, while the production guard also
+  requires `process.versions.electron`. Simulate/restore the Electron version descriptor
+  in those fixtures only. Keep the production guard and outside-Desktop tests unchanged.
+- The new Docker smoke initially ran PM2 CLI under `HOME=/root`, not the server's `/data`.
+  It started a different PM2 home/banner and failed JSON parsing. Use the PM2 API with
+  `HOME=/data` and `PM2_HOME=/data/.pm2`, returning only service names/status.
+- Rerun on local Node 24: **1137 core tests, 1127 passed, 0 failed, 10 skipped**.
+  Linux rerun remains required before merge.

@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { simulateElectronVersion } from "../../support/desktop-runtime.mjs";
 import { createDefaultAppConfig } from "@ccr/core/config/default-config.ts";
 import { pluginService } from "@ccr/core/plugins/service.ts";
 import { CCR_DESKTOP_APP_ENV } from "@ccr/core/runtime/desktop-app.ts";
@@ -321,12 +322,14 @@ function baseConfig(dir) {
 }
 
 async function withDesktopRuntime(run) {
+  const restoreElectron = simulateElectronVersion();
   const previousDesktopApp = process.env[CCR_DESKTOP_APP_ENV];
   try {
     process.env[CCR_DESKTOP_APP_ENV] = "1";
     return await run();
   } finally {
     restoreEnv(CCR_DESKTOP_APP_ENV, previousDesktopApp);
+    restoreElectron();
   }
 }
 

@@ -37,8 +37,8 @@ try {
     await waitFor(async () => (await fetch(url, { headers: { authorization } })).status === 200);
     assert.equal((await fetch(url)).status, 401);
     assert.equal((await fetch(url, { headers: { authorization: "Basic " + Buffer.from("smoke:wrong").toString("base64") } })).status, 401);
-    const processes = JSON.parse(docker("exec", name, "node", "-e",
-      "const cp=require('node:child_process');process.stdout.write(cp.execFileSync('/app/node_modules/.bin/pm2',['jlist'],{encoding:'utf8'}))"));
+    const processes = JSON.parse(docker("exec", "-e", "HOME=/data", "-e", "PM2_HOME=/data/.pm2", name, "node", "-e",
+      "const pm2=require('/app/node_modules/pm2');pm2.connect(err=>{if(err)throw err;pm2.list((err,list)=>{if(err)throw err;process.stdout.write(JSON.stringify(list.map(p=>({name:p.name,pm2_env:{status:p.pm2_env.status}}))));pm2.disconnect()})})"));
     for (const service of ["ccr-core-server", "ccr-nginx", "ccr-sshd"]) {
       assert.equal(processes.find(p => p.name === service)?.pm2_env.status, "online", service);
     }

@@ -1964,7 +1964,8 @@ test("RequestLogStore bounded heap regression", {
   delete workerEnv.NODE_TEST_CONTEXT;
   const { stderr, stdout } = await execFileAsync(
     process.execPath,
-    ["--max-old-space-size=64", "--test", __filename],
+    // Bound the young generation too: V8 defaults differ across Node/architectures.
+    ["--max-old-space-size=64", "--max-semi-space-size=4", "--test", __filename],
     {
       encoding: "utf8",
       env: workerEnv,
