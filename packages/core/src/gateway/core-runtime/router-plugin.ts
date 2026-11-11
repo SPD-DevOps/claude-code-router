@@ -376,7 +376,12 @@ export async function createGatewayPlugin(input: GatewayPluginFactoryInput = {})
           return undefined;
         }
         const apiKey = await resolveApiKey(config, requestInput.request?.headers);
-        setApiKeyAuthContextHeaders(requestInput.request?.headers, apiKey);
+        const trustedAuditId = apiKey?.id ?? (
+          isCoreGatewayRequest(requestInput.request?.headers, coreAuthToken)
+            ? readHeader(requestInput.request?.headers, "x-auth-api-key-id")
+            : undefined
+        );
+        setApiKeyAuthContextHeaders(requestInput.request?.headers, apiKey, trustedAuditId);
         return undefined;
       }
     }],
@@ -951,8 +956,8 @@ async function resolvePublicGatewayAuth(
     : { ok: false, status: 401, error: "Invalid or expired API key." };
 }
 
-function setApiKeyAuthContextHeaders(headers: Record<string, HeaderValue> | undefined, apiKey: ApiKeyConfig | undefined): void {
-  setAuditPrincipal(headers, apiKey?.id);
+function setApiKeyAuthContextHeaders(headers: Record<string, HeaderValue> | undefined, apiKey: ApiKeyConfig | undefined, auditId = apiKey?.id): void {
+  setAuditPrincipal(headers, auditId);
   if (!apiKey || !headers) {
     return;
   }
