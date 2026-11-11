@@ -28,7 +28,10 @@ function redact(text) {
     .replace(/\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b/g,"[EMAIL]");
 }
 function normalize(row, options) {
-  if (row.method !== "POST" || !["/v1/messages","/v1/chat/completions","/v1/responses"].includes(row.path)) return {skip:"not_inference"};
+  // Native gateway traces may retain provider base-path prefixes (Kimi/Codex).
+  const pathname = String(row.path || "").split("?")[0].replace(/\/$/, "");
+  const inference = ["/v1/messages", "/v1/chat/completions", "/v1/responses"].some(p=>pathname.endsWith(p)) || pathname === "/backend-api/codex/responses";
+  if (row.method !== "POST" || !inference) return {skip:"not_inference"};
   if (new Date(row.created_at) < new Date(options.since)) return {skip:"before_cutover"};
   let headers;try {headers=JSON.parse(row.request_headers);} catch {return {skip:"invalid_headers"};}
   const identity=headers["x-ccr-audit-principal"];

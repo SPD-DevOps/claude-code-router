@@ -16,3 +16,11 @@ test("cutover and oversize are explicit coverage exclusions",()=>{
  assert.equal(normalize({...row,created_at:"2026-11-10T00:00:00Z"},options).skip,"before_cutover");
  assert.equal(normalize({...row,request_body_truncated:1},options).skip,"truncated_body");
 });
+
+test("native provider base paths are audited and still exclude the dedicated auditor",()=>{
+ for(const path of ["/coding/v1/chat/completions","/backend-api/codex/responses"]){
+   assert.ok(normalize({...row,path},options).record);
+   assert.equal(normalize({...row,path,request_headers:JSON.stringify({"x-ccr-audit-principal":options.auditor})},options).skip,"auditor");
+ }
+ assert.equal(normalize({...row,path:"/v1/messages/count_tokens"},options).skip,"not_inference");
+});
