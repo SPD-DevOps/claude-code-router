@@ -71,6 +71,23 @@ async function exportOne(target) {
   const tmpPath = path.join("/tmp", `${target.name}-${now.getTime()}.sqlite`);
   await snapshotToTemp(srcPath, tmpPath);
 
+  if (target.name === "request-logs" && process.env.CCR_AUDIT_ENABLED === "1") {
+    try {
+      const { exportAudit } = require("./audit-export.cjs");
+      const instance = process.env.CCR_AUDIT_INSTANCE_ID;
+      const since = process.env.CCR_AUDIT_SINCE;
+      const auditor = process.env.CCR_AUDIT_EXCLUDE_PRINCIPAL;
+      if (!/^[a-z0-9-]+$/.test(instance || "") || !Number.isFinite(Date.parse(since || "")) || !/^[a-f0-9]{64}$/.test(auditor || "")) {
+        throw new Error("Audit export requires instance, cutover time and dedicated auditor principal");
+      }
+      await exportAudit(tmpPath, s3, PutObjectCommand, {
+        instance, since, auditor, bucket: process.env.CCR_AUDIT_S3_BUCKET || bucket,
+        bodyDir: path.join(dataDir, "request-log-bodies")
+      });
+    } catch (error) {
+      console.error("[audit-export] failed:", error.name);
+    }
+  }
   const raw = fs.readFileSync(tmpPath);
   fs.unlinkSync(tmpPath);
   const gz = zlib.gzipSync(raw);
@@ -90,7 +107,11 @@ async function exportOne(target) {
   console.log(`[log-export] uploaded s3://${bucket}/${key} (${gz.length} bytes)`);
 }
 
+let exporting = false;
 async function runOnce() {
+  if (exporting) return;
+  exporting = true;
+  try {
   for (const target of targets) {
     try {
       await exportOne(target);
@@ -98,6 +119,7 @@ async function runOnce() {
       console.error(`[log-export] failed to export ${target.name}: ${err.message}`);
     }
   }
+  } finally { exporting = false; }
 }
 
 async function main() {

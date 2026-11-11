@@ -1,3 +1,4 @@
+import { setAuditPrincipal } from "@ccr/core/observability/audit-principal";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { pipeline, Readable } from "node:stream";
@@ -951,6 +952,7 @@ async function resolvePublicGatewayAuth(
 }
 
 function setApiKeyAuthContextHeaders(headers: Record<string, HeaderValue> | undefined, apiKey: ApiKeyConfig | undefined): void {
+  setAuditPrincipal(headers, apiKey?.id);
   if (!apiKey || !headers) {
     return;
   }
