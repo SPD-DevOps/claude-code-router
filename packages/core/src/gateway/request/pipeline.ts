@@ -1,3 +1,4 @@
+import { setAuditPrincipal } from "@ccr/core/observability/audit-principal";
 import { randomUUID } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { Readable } from "node:stream";
@@ -141,6 +142,7 @@ export class GatewayRequestPipeline {
       routeTrace?.captureIngress();
       const headerNormalizationStartedAt = Date.now();
       const headers = forwardHeaders(request.headers);
+      setAuditPrincipal(headers, apiKey?.id);
       const strippedCcrRouteHeaderChanges = stripUntrustedCcrRouteHeaders(headers);
       const previousAuthorization = headers.authorization;
       const previousApiKey = headers["x-api-key"];

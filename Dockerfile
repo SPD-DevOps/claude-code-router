@@ -79,6 +79,7 @@ COPY --from=s3sdk /opt/ccr-s3-sdk/node_modules /opt/ccr-s3-sdk/node_modules
 COPY docker/entrypoint.sh /usr/local/bin/ccr-docker-entrypoint
 COPY docker/pm2.config.cjs docker/pm2.config.cjs
 COPY docker/log-export.cjs docker/log-export.cjs
+COPY docker/audit-export.cjs docker/audit-export.cjs
 
 RUN ln -s /opt/ccr-cli/bin/ccr /usr/local/bin/ccr \
   && chmod +x /usr/local/bin/ccr-docker-entrypoint \
