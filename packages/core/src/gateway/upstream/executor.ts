@@ -1037,8 +1037,12 @@ function selectProviderCredentials(
       weight: Math.max(1, credential.weight ?? 1)
     };
   });
-  const available = candidates.filter((candidate) => !candidate.cooldown && !candidate.limitState.blocked);
-  const sorted = sortProviderCredentialCandidates(available.length > 0 ? available : candidates);
+  const eligible = candidates.filter((candidate) => candidate.cooldown?.reason !== "HTTP 429");
+  if (eligible.length === 0 && candidates.length > 0) {
+    throw new Error(`All credentials for ${provider.name} are quarantined after HTTP 429; retry after quarantine expires.`);
+  }
+  const available = eligible.filter((candidate) => !candidate.cooldown && !candidate.limitState.blocked);
+  const sorted = sortProviderCredentialCandidates(available.length > 0 ? available : eligible);
   return {
     credentials: sorted.map((candidate) => ({
       credential: candidate.credential,
