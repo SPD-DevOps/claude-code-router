@@ -39,6 +39,8 @@ try {
     "-e",
     `CCR_WEB_AUTH_TOKEN=${token}`,
     "-e",
+    "CCR_ENABLE_UI_AUTH=0",
+    "-e",
     "CCR_PUBLIC_HOST=127.0.0.1",
     "-e",
     `CCR_PUBLIC_PORT=${hostPort}`,

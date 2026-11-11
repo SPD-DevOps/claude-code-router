@@ -1,8 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import {
   attachCodexRateLimitResetCreditDetails,
   codexDefaultBaseUrl,
+  codexDefaultClientVersion,
+  codexModelCatalogUrl,
+  probeCodexProvider,
   codexModelCatalogFromPayloadForTest,
   codexProviderAccountConfig,
   codexRateLimitResetCreditDetails,
@@ -366,3 +372,89 @@ test("Codex model catalog parser ignores invalid context metadata", () => {
 
   assert.equal(catalog.modelMetadata?.["invalid-context-model"], undefined);
 });
+
+
+test("Codex discovery sends the tested default client_version", () => {
+  const url = new URL(codexModelCatalogUrl(""));
+  assert.equal(url.origin + url.pathname, `${codexDefaultBaseUrl}/models`);
+  assert.equal(url.searchParams.get("client_version"), codexDefaultClientVersion);
+  assert.equal(codexDefaultClientVersion, "0.167.0");
+});
+
+test("Codex discovery permits an explicit client version without changing the endpoint", () => {
+  assert.equal(new URL(codexModelCatalogUrl(" 0.168.1 ")).searchParams.get("client_version"), "0.168.1");
+  assert.equal(new URL(codexModelCatalogUrl("0.168.1-beta.1")).searchParams.get("client_version"), "0.168.1-beta.1");
+  for (const value of ["latest", "0.168", "0.168.1&redirect=evil", "https://example.com"]) {
+    assert.throws(() => codexModelCatalogUrl(value), /semantic version/);
+  }
+});
+
+test("Codex discovery reads CCR_CODEX_CLIENT_VERSION at request time", () => {
+  const previous = process.env.CCR_CODEX_CLIENT_VERSION;
+  try {
+    process.env.CCR_CODEX_CLIENT_VERSION = "0.168.2";
+    assert.equal(new URL(codexModelCatalogUrl()).searchParams.get("client_version"), "0.168.2");
+    delete process.env.CCR_CODEX_CLIENT_VERSION;
+    assert.equal(new URL(codexModelCatalogUrl()).searchParams.get("client_version"), codexDefaultClientVersion);
+  } finally {
+    if (previous === undefined) delete process.env.CCR_CODEX_CLIENT_VERSION;
+    else process.env.CCR_CODEX_CLIENT_VERSION = previous;
+  }
+});
+
+
+async function withMockedCodexCatalog(response, run) {
+  const home = mkdtempSync(path.join(os.tmpdir(), "ccr-codex-discovery-"));
+  const previousHome = process.env.CCR_INTERNAL_HOME_DIR;
+  const previousVersion = process.env.CCR_CODEX_CLIENT_VERSION;
+  const originalFetch = globalThis.fetch;
+  try {
+    mkdirSync(path.join(home, ".codex"));
+    writeFileSync(path.join(home, ".codex", "auth.json"), JSON.stringify({
+      tokens: { access_token: "synthetic-test-token", account_id: "test-account" }
+    }), { mode: 0o600 });
+    process.env.CCR_INTERNAL_HOME_DIR = home;
+    process.env.CCR_CODEX_CLIENT_VERSION = "0.167.0";
+    globalThis.fetch = async (input, init) => {
+      assert.equal(new URL(String(input)).searchParams.get("client_version"), "0.167.0");
+      assert.equal(init.headers.authorization, "Bearer synthetic-test-token");
+      return response();
+    };
+    await run();
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (previousHome === undefined) delete process.env.CCR_INTERNAL_HOME_DIR;
+    else process.env.CCR_INTERNAL_HOME_DIR = previousHome;
+    if (previousVersion === undefined) delete process.env.CCR_CODEX_CLIENT_VERSION;
+    else process.env.CCR_CODEX_CLIENT_VERSION = previousVersion;
+    rmSync(home, { recursive: true, force: true });
+  }
+}
+
+const discoveryCandidate = {
+  id: "codex-api", kind: "codex", name: "Codex API", status: "available", importable: true,
+  protocol: "openai_responses", models: ["existing-model"]
+};
+
+test("Codex probe discovers the version-gated subscription catalog", async () => {
+  await withMockedCodexCatalog(() => Response.json({ models: [
+    { slug: "new-model-a", display_name: "New A" }, { slug: "new-model-b" }
+  ] }), async () => {
+    const result = await probeCodexProvider(discoveryCandidate);
+    assert.deepEqual(result.candidate.models, ["new-model-a", "new-model-b"]);
+    assert.deepEqual(discoveryCandidate.models, ["existing-model"]);
+  });
+});
+
+for (const [label, response] of [
+  ["HTTP error", () => Response.json({ error: { message: "unavailable" } }, { status: 429 })],
+  ["empty catalog", () => Response.json({ models: [] })],
+  ["transport failure", () => { throw new Error("synthetic network failure"); }]
+]) {
+  test(`Codex probe preserves existing models on ${label}`, async () => {
+    await withMockedCodexCatalog(response, async () => {
+      const result = await probeCodexProvider(discoveryCandidate);
+      assert.deepEqual(result.candidate.models, ["existing-model"]);
+    });
+  });
+}

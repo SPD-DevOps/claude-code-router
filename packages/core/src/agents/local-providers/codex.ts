@@ -39,6 +39,20 @@ const codexAccountBaseUrl = "https://chatgpt.com/backend-api";
 const codexDefaultModels = ["gpt-5-codex"];
 const codexProbeTimeoutMs = 8_000;
 
+// The subscription catalog is gated by the Codex client's version, not CCR's version.
+export const codexDefaultClientVersion = "0.167.0";
+
+export function codexModelCatalogUrl(clientVersion = process.env.CCR_CODEX_CLIENT_VERSION): string {
+  const version = clientVersion?.trim() || codexDefaultClientVersion;
+  if (!/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(version)) {
+    throw new Error("CCR_CODEX_CLIENT_VERSION must be a semantic version, for example 0.167.0.");
+  }
+  const url = new URL(`${codexDefaultBaseUrl}/models`);
+  url.searchParams.set("client_version", version);
+  return url.toString();
+}
+
+
 export type LocalAgentModelCatalog = {
   modelDisplayNames?: Record<string, string>;
   modelMetadata?: Record<string, ProviderModelMetadata>;
@@ -639,7 +653,7 @@ async function fetchCodexModelCatalog(): Promise<LocalAgentModelCatalog> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), codexProbeTimeoutMs);
   try {
-    const response = await fetchWithSystemProxy(`${codexDefaultBaseUrl}/models`, {
+    const response = await fetchWithSystemProxy(codexModelCatalogUrl(), {
       headers: {
         accept: "application/json",
         authorization: `Bearer ${auth.accessToken}`,

@@ -18,12 +18,14 @@ RUN if ls docker/local-ai-gateway/*.tgz >/dev/null 2>&1; then \
 RUN npm run build:docker
 
 FROM ${NODE_IMAGE} AS cli
-RUN npm install -g --prefix /opt/ccr-cli @musistudio/claude-code-router \
+ARG CCR_CLI_VERSION=3.1.3
+RUN npm install -g --prefix /opt/ccr-cli @musistudio/claude-code-router@${CCR_CLI_VERSION} \
   && npm cache clean --force
 
 FROM ${NODE_IMAGE} AS s3sdk
 WORKDIR /opt/ccr-s3-sdk
-RUN npm install @aws-sdk/client-s3 \
+ARG CCR_S3_SDK_VERSION=3.1166.0
+RUN npm install @aws-sdk/client-s3@${CCR_S3_SDK_VERSION} \
   && npm cache clean --force
 
 FROM ${NODE_IMAGE} AS production-deps
