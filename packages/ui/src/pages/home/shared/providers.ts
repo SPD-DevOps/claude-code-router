@@ -645,6 +645,8 @@ export function createProviderDraftFromDeepLinkPayload(
     catalogModelMetadata: undefined,
     credentialMode: "apiKey",
     credentials: [],
+    extraBodyText: "",
+    extraHeadersText: "",
     icon: payload.icon?.trim() || "",
     modelDescriptions: modelDescriptionsForModels(payload.modelDescriptions, models),
     modelDisplayNames: modelDisplayNamesForModels(
@@ -743,6 +745,8 @@ export function createProviderDraft(providers: GatewayProviderConfig[]): AddProv
     catalogModelMetadata: undefined,
     credentialMode: "apiKey",
     credentials: [],
+    extraBodyText: "",
+    extraHeadersText: "",
     icon: "",
     modelDescriptions: undefined,
     modelDisplayNames: undefined,
@@ -775,6 +779,8 @@ export function createProviderDraftFromProvider(provider: GatewayProviderConfig)
     catalogModelMetadata: undefined,
     credentialMode: providerDraftHasReadyCredentialPool({ credentials }) ? "pool" : "apiKey",
     credentials,
+    extraBodyText: providerExtraJsonDraftText(provider.extraBody),
+    extraHeadersText: providerExtraJsonDraftText(provider.extraHeaders),
     icon: provider.icon ?? "",
     modelDescriptions: modelDescriptionsForModels(provider.modelDescriptions, provider.models),
     modelDisplayNames: modelDisplayNamesForModels(
@@ -1987,10 +1993,101 @@ export function providerCapabilitiesForSave(
   const normalizedNextBaseUrl = normalizeProviderBaseUrl(nextBaseUrl) || nextBaseUrl.trim();
   const preserveExisting = normalizedExistingBaseUrl === undefined ||
     normalizedExistingBaseUrl === normalizedNextBaseUrl;
+  const selectedTypes = new Set(currentCapabilities.map((capability) => capability.type));
+  const retainedCapabilities = preservedCapabilities.filter((capability) =>
+    selectedTypes.has(capability.type) ||
+    !providerProtocolOptions.some((option) => option.value === capability.type)
+  );
   return mergeProviderCapabilities(
     currentCapabilities,
-    ...(preserveExisting ? [preservedCapabilities] : [])
+    ...(preserveExisting ? [retainedCapabilities] : [])
   );
+}
+
+export type ProviderManualFields = Pick<
+  GatewayProviderConfig,
+  "billing" | "provider" | "transformer"
+>;
+
+/**
+ * Provider fields the setup dialog cannot edit.
+ *
+ * Saving rebuilds the provider from the dialog draft, so a field the form does
+ * not know about is dropped unless it is carried over explicitly. These fields
+ * only ever come from a hand-written config, and losing them is silent: the
+ * provider keeps working, just without the billing metadata or transformers it
+ * was configured with.
+ *
+ * `extraBody` and `extraHeaders` are not listed here — the Advanced settings
+ * section edits them, so they round-trip through the draft instead.
+ *
+ * The legacy `apiKey` / `apikey` / `baseUrl` / `baseurl` aliases are deliberately
+ * not carried over — the form writes the canonical `api_key` / `api_base_url`,
+ * and a stale alias would shadow the value the user just typed.
+ */
+export function providerManualFieldsForSave(
+  existingProvider: GatewayProviderConfig | undefined
+): ProviderManualFields {
+  if (!existingProvider) {
+    return {};
+  }
+  const preserved: ProviderManualFields = {
+    billing: existingProvider.billing,
+    provider: existingProvider.provider,
+    transformer: existingProvider.transformer
+  };
+  // Keep the saved provider free of keys it never had, so an unrelated edit does
+  // not show up as a config change.
+  for (const field of Object.keys(preserved) as Array<keyof ProviderManualFields>) {
+    if (preserved[field] === undefined) {
+      delete preserved[field];
+    }
+  }
+  return preserved;
+}
+
+export type ProviderExtraJsonField = "extraBody" | "extraHeaders";
+
+const providerExtraJsonInvalidMessages: Record<ProviderExtraJsonField, string> = {
+  extraBody: "Extra request body JSON is invalid.",
+  extraHeaders: "Extra request headers JSON is invalid."
+};
+
+const providerExtraJsonShapeMessages: Record<ProviderExtraJsonField, string> = {
+  extraBody: "Extra request body must be a JSON object.",
+  extraHeaders: "Extra request headers must be a JSON object."
+};
+
+export function providerExtraJsonDraftText(value: unknown): string {
+  if (value === undefined || value === null) {
+    return "";
+  }
+  return JSON.stringify(value, null, 2);
+}
+
+/**
+ * Parses one of the Advanced settings JSON boxes.
+ *
+ * Returns the parsed object, `undefined` when the box is empty, or an error
+ * message string the caller surfaces the same way as the other draft issues.
+ */
+export function parseProviderExtraJsonDraft(
+  text: string,
+  field: ProviderExtraJsonField
+): Record<string, unknown> | undefined | string {
+  if (!text.trim()) {
+    return undefined;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return providerExtraJsonInvalidMessages[field];
+  }
+  if (!isPlainRecord(parsed)) {
+    return providerExtraJsonShapeMessages[field];
+  }
+  return parsed;
 }
 
 export function providerGlobalBaseUrlForProbe(
@@ -2055,6 +2152,13 @@ export function providerCapabilitiesForProtocols(
   return mergeProviderCapabilities(selectedCapabilities, detectedMediaCapabilities);
 }
 
+export function providerProbeModelsForProtocol(
+  probe: GatewayProviderProbeResult | undefined,
+  protocol: GatewayProviderProtocol
+): string[] {
+  return probe?.protocolModels?.[protocol] ?? probe?.models ?? [];
+}
+
 export function applyProviderProbeResult(draft: AddProviderDraft, probe: GatewayProviderProbeResult): AddProviderDraft {
   const detectedProtocol = probe.detectedProtocol ?? draft.protocol;
   const selectedProtocols = selectedProviderProtocolsForProbe(draft.selectedProtocols, probe, detectedProtocol, draft.presetId);
@@ -2063,13 +2167,14 @@ export function applyProviderProbeResult(draft: AddProviderDraft, probe: Gateway
     : selectedProtocols.includes(detectedProtocol)
     ? detectedProtocol
     : selectedProtocols[0] ?? detectedProtocol;
+  const probeModels = providerProbeModelsForProtocol(probe, protocol);
   const modelDisplayNames = mergeModelDisplayNames(draft.modelDisplayNames, probe.modelDisplayNames);
   const catalogModelMetadata = mergeModelMetadata(draft.catalogModelMetadata, probe.catalogModelMetadata);
   const modelMetadata = mergeModelMetadata(draft.modelMetadata, probe.modelMetadata);
   const accountDraft = providerProbeAccountDraftPatch(draft, probe.account);
   const baseUrl = providerGlobalBaseUrlForProbe(draft.baseUrl, probe, selectedProtocols);
 
-  if (probe.models.length === 0) {
+  if (probeModels.length === 0) {
     return {
       ...draft,
       ...accountDraft,
@@ -2083,7 +2188,7 @@ export function applyProviderProbeResult(draft: AddProviderDraft, probe: Gateway
     };
   }
 
-  const detectedModels = new Set(probe.models);
+  const detectedModels = new Set(probeModels);
   const typedModels = splitLines(draft.modelsText);
   const selectedCatalogModels = draft.selectedModels.filter((model) => detectedModels.has(model));
   const selectedCustomModels = draft.selectedModels.filter((model) => !detectedModels.has(model));
@@ -2093,7 +2198,7 @@ export function applyProviderProbeResult(draft: AddProviderDraft, probe: Gateway
   const customModels = mergeProviderModelLists(selectedCustomModels, typedCustomModels);
   const nextSelectedModels = selectedModels.length > 0 || customModels.length > 0
     ? selectedModels
-    : pickRecommendedProviderModels(probe.models, probe.detectedProtocol);
+    : pickRecommendedProviderModels(probeModels, probe.detectedProtocol);
 
   return {
     ...draft,
@@ -2146,7 +2251,15 @@ export function mergeModelMetadata(
       if (!model || !metadata || typeof metadata !== "object") {
         continue;
       }
-      merged[model] = metadata;
+      const pinned = merged[model]?.contextWindowPinned ? merged[model] : undefined;
+      merged[model] = pinned
+        ? {
+            ...metadata,
+            contextWindow: pinned.contextWindow,
+            contextWindowPinned: true,
+            maxContextWindow: pinned.maxContextWindow
+          }
+        : metadata;
     }
   }
   return Object.keys(merged).length > 0 ? merged : undefined;

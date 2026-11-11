@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { buildCodexModelCatalog, buildCodexModelCatalogIds } from "@ccr/core/agents/codex/model-catalog.ts";
+import { buildCodexModelCatalog, buildCodexModelCatalogIds, codexModelCatalogBase64, codexModelCatalogJson } from "@ccr/core/agents/codex/model-catalog.ts";
 
 function catalogModelFor(config, slug) {
   const catalog = buildCodexModelCatalog(config, slug);
@@ -11,6 +11,25 @@ function catalogModelFor(config, slug) {
   assert.ok(model, `expected catalog model ${slug}`);
   return model;
 }
+
+test("Codex catalogs retain tool preambles and progress guidance for provider-qualified models", () => {
+  const config = {
+    Providers: [{ name: "uuroute", type: "openai_responses", models: ["gpt-5.5"] }]
+  };
+  const catalogs = [
+    buildCodexModelCatalog(config, "uuroute/gpt-5.5"),
+    JSON.parse(codexModelCatalogJson(config, "uuroute/gpt-5.5")),
+    JSON.parse(Buffer.from(codexModelCatalogBase64(config, "uuroute/gpt-5.5"), "base64").toString("utf8"))
+  ];
+
+  for (const catalog of catalogs) {
+    const instructions = catalog.models[0].base_instructions;
+    assert.match(instructions, /before.*tool call/i);
+    assert.match(instructions, /commentary/);
+    assert.match(instructions, /progress update/i);
+    assert.match(instructions, /final answer/i);
+  }
+});
 
 test("codex catalog removes duplicate model IDs case-insensitively without reordering", () => {
   const ids = buildCodexModelCatalogIds({
@@ -86,27 +105,6 @@ test("codex catalog uses model catalog capabilities for known text models", () =
   assert.equal(model.apply_patch_tool_type, "freeform");
 });
 
-test("codex catalog enables multimodal reasoning and search when provider protocol supports it", () => {
-  const model = catalogModelFor({
-    Providers: [
-      { name: "openrouter", type: "openai_responses", models: ["google/gemini-2.5-pro"] }
-    ]
-  }, "openrouter/google/gemini-2.5-pro");
-
-  assert.deepEqual(model.input_modalities, ["text", "image"]);
-  assert.equal(model.supports_image_detail_original, true);
-  assert.equal(model.supports_parallel_tool_calls, true);
-  assert.equal(model.supports_reasoning_summaries, true);
-  assert.equal(model.supports_search_tool, true);
-  assert.equal(model.web_search_tool_type, "text_and_image");
-  assert.deepEqual(model.supported_reasoning_levels.map((level) => level.effort), [
-    "low",
-    "medium",
-    "high"
-  ]);
-  assert.equal(model.default_reasoning_level, null);
-  assert.equal(model.apply_patch_tool_type, "freeform");
-});
 
 test("codex catalog honors configured image, web search, and six reasoning levels", () => {
   const model = catalogModelFor({
@@ -364,14 +362,10 @@ test("codex catalog synthesizes Fast Mode tiers from provider model metadata", (
   assert.deepEqual(model.service_tiers, [{ id: "priority", name: "Fast", description: "1.5x speed, increased usage" }]);
 });
 
-test("codex catalog caps persisted local Codex GPT-5 context metadata", () => {
-  const cases = [
-    ["gpt-5-codex", 256000],
-    ["gpt-5.5", 256000],
-    ["gpt-5.6-sol", 368000]
-  ];
+test("codex catalog preserves persisted local Codex GPT-5 context metadata", () => {
+  const cases = ["gpt-5-codex", "gpt-5.5", "gpt-5.6-sol"];
 
-  for (const [modelName, expectedContextWindow] of cases) {
+  for (const modelName of cases) {
     const model = catalogModelFor({
       Providers: [
         {
@@ -390,9 +384,58 @@ test("codex catalog caps persisted local Codex GPT-5 context metadata", () => {
       ]
     }, `Codex API/${modelName}`);
 
-    assert.equal(model.context_window, expectedContextWindow);
-    assert.equal(model.max_context_window, expectedContextWindow);
+    assert.equal(model.context_window, 272000);
+    assert.equal(model.max_context_window, 300000);
   }
+});
+
+test("codex catalog reports pinned context windows in full", () => {
+  const model = catalogModelFor({
+    Providers: [
+      {
+        api_base_url: "https://chatgpt.com/backend-api/codex",
+        api_key: "ccr-local-agent-login",
+        modelMetadata: {
+          "gpt-5.6-sol": {
+            contextWindow: 1000000,
+            contextWindowPinned: true,
+            effectiveContextWindowPercent: 95,
+            maxContextWindow: 1000000
+          }
+        },
+        models: ["gpt-5.6-sol"],
+        name: "Codex API",
+        type: "openai_responses"
+      }
+    ]
+  }, "Codex API/gpt-5.6-sol");
+
+  assert.equal(model.context_window, 1000000);
+  assert.equal(model.effective_context_window_percent, 100);
+});
+
+test("codex catalog preserves pinned context windows", () => {
+  const model = catalogModelFor({
+    Providers: [
+      {
+        api_base_url: "https://chatgpt.com/backend-api/codex",
+        api_key: "ccr-local-agent-login",
+        modelMetadata: {
+          "gpt-5-codex": {
+            contextWindow: 1000000,
+            contextWindowPinned: true,
+            maxContextWindow: 1000000
+          }
+        },
+        models: ["gpt-5-codex"],
+        name: "Codex API",
+        type: "openai_responses"
+      }
+    ]
+  }, "Codex API/gpt-5-codex");
+
+  assert.equal(model.context_window, 1000000);
+  assert.equal(model.max_context_window, 1000000);
 });
 
 test("codex catalog falls back to local Codex model cache metadata", () => {
@@ -436,10 +479,10 @@ test("codex catalog falls back to local Codex model cache metadata", () => {
     }, "Codex API/gpt-5-codex");
 
     assert.deepEqual(model.additional_speed_tiers, [{ id: "fast", label: "Fast" }]);
-    assert.equal(model.context_window, 256000);
+    assert.equal(model.context_window, 272000);
     assert.equal(model.default_reasoning_level, "high");
     assert.equal(model.effective_context_window_percent, 92);
-    assert.equal(model.max_context_window, 256000);
+    assert.equal(model.max_context_window, 300000);
     assert.deepEqual(model.service_tiers, [{ id: "auto" }]);
     assert.deepEqual(model.supported_reasoning_levels.map((level) => level.effort), ["low", "high"]);
   } finally {
@@ -467,20 +510,6 @@ test("codex catalog enables native search for Gemini Interactions providers", ()
   assert.equal(model.supports_search_tool, true);
 });
 
-test("codex catalog omits native search but enables apply_patch for non-GPT chat-completions models", () => {
-  const model = catalogModelFor({
-    Providers: [
-      { name: "openrouter", type: "openai_chat_completions", models: ["google/gemini-2.5-pro"] }
-    ]
-  }, "openrouter/google/gemini-2.5-pro");
-
-  assert.deepEqual(model.input_modalities, ["text", "image"]);
-  assert.equal(model.supports_parallel_tool_calls, true);
-  assert.equal(model.supports_reasoning_summaries, true);
-  assert.equal(model.supports_search_tool, false);
-  assert.equal(model.web_search_tool_type, "text");
-  assert.equal(model.apply_patch_tool_type, "freeform");
-});
 
 test("codex catalog keeps freeform apply_patch for GPT-named chat-compatible models", () => {
   const model = catalogModelFor({

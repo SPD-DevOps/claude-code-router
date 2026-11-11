@@ -1,9 +1,10 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { resolveRuntimeAppPath } from "@ccr/core/runtime/app-paths";
 import { saveAppConfig } from "@ccr/core/config/config";
+import { updatePersistedApiKeys } from "@ccr/core/config/config-repository";
 import { CONFIGDIR } from "@ccr/core/config/constants";
 import {
   buildClaudeAppGatewayInferenceModels,
@@ -24,21 +25,18 @@ const claudeAppGatewayModelRouteOptions: ClaudeAppGatewayModelRouteOptions = {
   supportsOneMillionContext: (model) => Boolean(findModelCatalogEntry(model)?.limits?.supports1MContext)
 };
 
+export const NO_CLAUDE_APP_ENTRY_PROFILE_MESSAGE =
+  "No enabled claude-code profile can open the Claude App. Set a profile's Entry mode to App or Auto to configure the Claude App for CCR.";
+
 type ClaudeAppGatewayConfig = {
-  authentication: {
-    disableClaudeAiSignIn: true;
-  };
   bootstrapEnabled: false;
   inferenceCredentialKind: "static";
   inferenceGatewayApiKey: string;
   inferenceGatewayAuthScheme: "x-api-key";
   inferenceGatewayBaseUrl: string;
   inferenceModels: ClaudeAppGatewayInferenceModel[];
-  inferenceModelsUpdatedAt: string;
-  inferenceModelsVersion: string;
   inferenceProvider: "gateway";
   modelDiscoveryEnabled: true;
-  unstableDisableModelVerification: true;
 };
 
 type ClaudeAppApplyState = {
@@ -81,7 +79,19 @@ export type ClaudeAppGatewaySyncResult = {
   result: ClaudeAppGatewayApplyResult;
 };
 
+export function hasClaudeAppEntryProfile(config: Pick<AppConfig, "profile">): boolean {
+  return config.profile.profiles.some((profile) => profile.enabled && profile.agent === "claude-code" && profile.surface !== "cli");
+}
+
 export async function syncClaudeAppGatewayConfig(config: AppConfig): Promise<ClaudeAppGatewaySyncResult> {
+  if (!hasClaudeAppEntryProfile(config)) {
+    restoreClaudeAppGatewayConfig();
+    return {
+      config,
+      configChanged: false,
+      result: skippedClaudeAppGatewayResult(config, NO_CLAUDE_APP_ENTRY_PROFILE_MESSAGE)
+    };
+  }
   if (!hasAvailableGatewayModels(config)) {
     return {
       config,
@@ -99,6 +109,13 @@ export async function syncClaudeAppGatewayConfig(config: AppConfig): Promise<Cla
     };
   }
 
+  if (applied.result.apiKeyGenerated) {
+    const generatedKey = applied.config.APIKEYS.find((key) => key.key === applied.config.APIKEY);
+    if (generatedKey) {
+      await updatePersistedApiKeys((current) => [...current, generatedKey]);
+    }
+  }
+
   return {
     config: await saveAppConfig(applied.config),
     configChanged: true,
@@ -106,7 +123,10 @@ export async function syncClaudeAppGatewayConfig(config: AppConfig): Promise<Cla
   };
 }
 
-function skippedClaudeAppGatewayResult(config: AppConfig): ClaudeAppGatewayApplyResult {
+function skippedClaudeAppGatewayResult(
+  config: AppConfig,
+  message: string = NO_AVAILABLE_GATEWAY_MODELS_MESSAGE
+): ClaudeAppGatewayApplyResult {
   const paths = getClaudeAppGatewayPaths();
   return {
     apiKeyGenerated: false,
@@ -114,7 +134,7 @@ function skippedClaudeAppGatewayResult(config: AppConfig): ClaudeAppGatewayApply
     configLibraryFile: paths.configLibraryFile,
     dataDir: paths.dataDir,
     endpoint: gatewayEndpoint(config),
-    message: NO_AVAILABLE_GATEWAY_MODELS_MESSAGE,
+    message,
     model: "",
     requiresRestart: false
   };
@@ -134,22 +154,15 @@ export function applyClaudeAppGatewayConfig(config: AppConfig, options: ClaudeAp
     defaultTargetModel: options.defaultModel
   });
   const model = models[0]?.name ?? "";
-  const modelsVersion = claudeAppGatewayModelsVersion(endpoint, models);
   const gatewayConfig: ClaudeAppGatewayConfig = {
-    authentication: {
-      disableClaudeAiSignIn: true
-    },
     bootstrapEnabled: false,
     inferenceCredentialKind: "static",
     inferenceGatewayApiKey: state.apiKey,
     inferenceGatewayAuthScheme: "x-api-key",
     inferenceGatewayBaseUrl: endpoint,
     inferenceModels: models,
-    inferenceModelsUpdatedAt: new Date().toISOString(),
-    inferenceModelsVersion: modelsVersion,
     inferenceProvider: "gateway",
-    modelDiscoveryEnabled: true,
-    unstableDisableModelVerification: true
+    modelDiscoveryEnabled: true
   };
 
   if (options.backup !== false) {
@@ -157,7 +170,7 @@ export function applyClaudeAppGatewayConfig(config: AppConfig, options: ClaudeAp
   }
   for (const targetPaths of uniqueClaudeAppGatewayPaths([paths, activePaths])) {
     mkdirSync(targetPaths.libraryDir, { mode: 0o700, recursive: true });
-    writeJsonFile(targetPaths.configLibraryFile, gatewayConfig);
+    applyClaudeAppGatewayLibraryConfig(targetPaths.configLibraryFile, gatewayConfig);
     applyClaudeAppConfigMeta(targetPaths.metaFile);
     applyClaudeAppDeploymentMode(targetPaths.rootConfigFile);
     if (options.refreshModelDiscoveryCache) {
@@ -180,14 +193,7 @@ export function applyClaudeAppGatewayConfig(config: AppConfig, options: ClaudeAp
   };
 }
 
-function claudeAppGatewayModelsVersion(endpoint: string, models: ClaudeAppGatewayInferenceModel[]): string {
-  return createHash("sha256")
-    .update(JSON.stringify({ endpoint, models }))
-    .digest("hex")
-    .slice(0, 16);
-}
-
-function refreshClaudeAppModelDiscoveryCache(dataDir: string): void {
+export function refreshClaudeAppModelDiscoveryCache(dataDir: string): void {
   for (const relativePath of [
     "Cache",
     "Code Cache",
@@ -209,9 +215,9 @@ export function restoreClaudeAppGatewayConfig(): void {
   }
 
   const paths = getClaudeAppGatewayPaths();
-  restoreFileSnapshot(paths.rootConfigFile, backup.rootConfigFile);
-  restoreFileSnapshot(paths.metaFile, backup.metaFile);
-  restoreFileSnapshot(paths.configLibraryFile, backup.configLibraryFile);
+  restoreClaudeAppOwnedKey(paths.rootConfigFile, backup.rootConfigFile, "deploymentMode", "3p");
+  restoreClaudeAppOwnedKey(paths.metaFile, backup.metaFile, "appliedId", CLAUDE_APP_CONFIG_ID);
+  // The inactive library entry contains preferences Claude writes during takeover.
   rmSync(CLAUDE_APP_GATEWAY_BACKUP_FILE, { force: true });
 }
 
@@ -427,6 +433,48 @@ function gatewayEndpoint(config: AppConfig): string {
   const formattedHost = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
   const port = Number.isInteger(config.gateway.port) && config.gateway.port > 0 ? config.gateway.port : config.PORT;
   return `http://${formattedHost}:${port}`;
+}
+
+function restoreClaudeAppOwnedKey(
+  file: string,
+  snapshot: ClaudeAppGatewayFileSnapshot,
+  key: string,
+  appliedValue: string
+): void {
+  const current = readJsonRecord(file);
+  if (!current) {
+    restoreFileSnapshot(file, snapshot);
+    return;
+  }
+  if (current[key] !== appliedValue) {
+    return;
+  }
+  let previous: Record<string, unknown> = {};
+  if (snapshot.exists && snapshot.content) {
+    try {
+      const parsed: unknown = JSON.parse(snapshot.content);
+      if (isPlainRecord(parsed)) previous = parsed;
+    } catch {
+      // An invalid original file has no configuration key to restore.
+    }
+  }
+  if (Object.hasOwn(previous, key)) {
+    current[key] = previous[key];
+  } else {
+    delete current[key];
+  }
+  writeJsonFile(file, current);
+}
+
+function applyClaudeAppGatewayLibraryConfig(file: string, gatewayConfig: ClaudeAppGatewayConfig): void {
+  const current = readJsonRecord(file);
+  for (const key of ["authentication", "inferenceModelsUpdatedAt", "inferenceModelsVersion", "unstableDisableModelVerification"]) {
+    if (current) delete current[key];
+  }
+  writeJsonFile(file, {
+    ...(current ?? {}),
+    ...gatewayConfig
+  });
 }
 
 function applyClaudeAppConfigMeta(metaFile: string): void {

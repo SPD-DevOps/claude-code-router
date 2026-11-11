@@ -1,4 +1,4 @@
-import { BUILTIN_FUSION_VISION_TOOL_NAME, BUILTIN_FUSION_WEB_SEARCH_TOOL_NAME, isGatewayProviderEnabled } from "@ccr/core/contracts/app";
+import { BUILTIN_FUSION_VISION_TOOL_NAME, BUILTIN_FUSION_WEB_SEARCH_TOOL_NAME, effectiveContextWindowPercentFor, isGatewayProviderEnabled } from "@ccr/core/contracts/app";
 import type { AppConfig, GatewayProviderConfig, GatewayProviderProtocol, ProviderModelMetadata, ProviderReasoningLevel, VirtualModelProfileConfig } from "@ccr/core/contracts/app";
 import {
   findModelCatalogEntry,
@@ -6,11 +6,12 @@ import {
   readCatalogCapability,
   type ModelCatalogEntry
 } from "@ccr/core/gateway/model-catalog";
-import { codexDefaultBaseUrl, codexImportedModelContextWindow, readCodexLocalModelCatalog } from "@ccr/core/agents/local-providers/codex";
+import { codexDefaultBaseUrl, readCodexLocalModelCatalog } from "@ccr/core/agents/local-providers/codex";
 import { localAgentProviderApiKey } from "@ccr/core/agents/local-providers/shared";
 import { normalizeProviderBaseUrl } from "@ccr/core/providers/url";
 import { resolveUsageModelAttribution } from "@ccr/core/usage/model-attribution";
 import { filterModelIdsByAllowedModels } from "@ccr/core/profiles/model-allowlist";
+import { codexBaseInstructions } from "@ccr/core/agents/codex/base-instructions";
 
 const fusionModelProviderName = "Fusion";
 const codexDefaultContextWindow = 128_000;
@@ -156,12 +157,15 @@ function codexModelCatalogItem(
   const profile = codexModelCapabilityProfile(model, config);
   const contextWindow = positiveInteger(profile.contextWindow) ?? positiveInteger(profile.maxContextWindow) ?? codexModelContextWindow(model, profile.catalogEntry);
   const maxContextWindow = Math.max(contextWindow, positiveInteger(profile.maxContextWindow) ?? contextWindow);
-  const effectiveContextWindowPercent = percentage(profile.effectiveContextWindowPercent) ?? codexEffectiveContextWindowPercent;
+  const effectiveContextWindowPercent = effectiveContextWindowPercentFor({
+    contextWindowPinned: profile.contextWindowPinned,
+    effectiveContextWindowPercent: profile.effectiveContextWindowPercent
+  }) ?? codexEffectiveContextWindowPercent;
   return {
     additional_speed_tiers: profile.additionalSpeedTiers,
     apply_patch_tool_type: profile.applyPatchToolType,
     availability_nux: null,
-    base_instructions: "You are Codex, a coding agent.",
+    base_instructions: codexBaseInstructions,
     context_window: contextWindow,
     defaultReasoningEffort: profile.defaultReasoningLevel,
     default_reasoning_level: profile.defaultReasoningLevel,
@@ -209,6 +213,7 @@ type CodexCapabilityProfile = {
   applyPatchToolType: string | null;
   catalogEntry?: ModelCatalogEntry;
   contextWindow?: number;
+  contextWindowPinned?: boolean;
   description?: string;
   defaultReasoningLevel: string | null;
   defaultReasoningSummary: string;
@@ -281,6 +286,7 @@ function codexModelCapabilityProfile(
     applyPatchToolType,
     catalogEntry,
     contextWindow: providerModelMetadata?.contextWindow,
+    contextWindowPinned: providerModelMetadata?.contextWindowPinned,
     description: provider
       ? providerModelDescriptionFor(provider, providerModel)
       : undefined,
@@ -341,19 +347,7 @@ function providerModelDescriptionFor(provider: GatewayProviderConfig, model: str
 }
 
 function codexProviderModelMetadataFor(provider: GatewayProviderConfig, model: string): ProviderModelMetadata | undefined {
-  const metadata = providerModelMetadataFor(provider, model) ?? localCodexModelMetadataFor(provider, model);
-  if (!isLocalCodexProvider(provider)) {
-    return metadata;
-  }
-  const contextWindow = codexImportedModelContextWindow(model);
-  if (!contextWindow) {
-    return metadata;
-  }
-  return {
-    ...(metadata ?? {}),
-    contextWindow,
-    maxContextWindow: contextWindow
-  };
+  return providerModelMetadataFor(provider, model) ?? localCodexModelMetadataFor(provider, model);
 }
 
 function localCodexModelMetadataFor(provider: GatewayProviderConfig, model: string): ProviderModelMetadata | undefined {
@@ -446,12 +440,6 @@ function effortDescription(effort: string): string {
 
 function codexModelContextWindow(model: string, entry = findModelCatalogEntry(model)): number {
   return modelCatalogMaxInputTokens(entry) || codexDefaultContextWindow;
-}
-
-function percentage(value: number | undefined): number | undefined {
-  return value !== undefined && Number.isFinite(value) && value > 0 && value <= 100
-    ? value
-    : undefined;
 }
 
 function positiveInteger(value: number | undefined): number | undefined {

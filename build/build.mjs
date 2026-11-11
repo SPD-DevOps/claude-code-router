@@ -1,3 +1,5 @@
+import "../scripts/generate-models-json.mjs";
+import "./../scripts/generate-claude-code-config-options.mjs";
 import { buildBrowserRenderer, buildMain, buildRenderer, buildRequestLogBodyWorker, buildStyles, buildTrayRenderer, buildWebClientBridge, cleanDist, copyAppAssets, copyBrowserRendererHtml, copyBundledClaudeRuntimePlugins, copyModelCatalog, copyRendererHtml, copyTrayRendererHtml, syncUiRendererToRuntimeDists } from "./esbuild.config.mjs";
 
 const mode = process.argv.includes("--dev") ? "development" : "production";

@@ -5,7 +5,7 @@ import type {
   ProviderModelPricing
 } from "@ccr/core/contracts/app";
 import { providerUrlWithDefaultScheme } from "@ccr/core/providers/url";
-import { loadModelCatalogPayload } from "@ccr/core/models/catalog-file";
+import { loadModelCatalogPayload, modelCatalogRevision, scheduleModelCatalogRefresh } from "@ccr/core/models/catalog-file";
 import { findProviderPreset, findProviderPresetByBaseUrl } from "@ccr/core/providers/presets/index";
 
 type CatalogProviderEntry = {
@@ -70,10 +70,27 @@ const presetCatalogModelOverrides: Record<string, CatalogProviderModelOverride> 
   }
 };
 
+let catalogRevision = -1;
 let catalogIndex: CatalogIndex | undefined;
+const catalogResultCache = new Map<string, ProviderCatalogModelsResult>();
+const CATALOG_RESULT_CACHE_LIMIT = 512;
 
 export function getProviderCatalogModels(request: ProviderCatalogModelsRequest): ProviderCatalogModelsResult {
   const index = loadCatalogIndex();
+  const key = JSON.stringify([request.providerPresetId, request.baseUrl, request.name, request.providerIds]);
+  const cached = catalogResultCache.get(key);
+  if (cached) {
+    return { ...cached };
+  }
+  const result = resolveProviderCatalogModels(index, request);
+  if (catalogResultCache.size >= CATALOG_RESULT_CACHE_LIMIT) {
+    catalogResultCache.delete(catalogResultCache.keys().next().value!);
+  }
+  catalogResultCache.set(key, result);
+  return { ...result };
+}
+
+function resolveProviderCatalogModels(index: CatalogIndex, request: ProviderCatalogModelsRequest): ProviderCatalogModelsResult {
   const modelOverride = providerCatalogModelOverride(request);
   if (modelOverride) {
     const { metadataModelAliases, ...result } = modelOverride;
@@ -153,6 +170,13 @@ function catalogOverrideModelMetadata(
 }
 
 function loadCatalogIndex(): CatalogIndex {
+  scheduleModelCatalogRefresh();
+  const currentRevision = modelCatalogRevision();
+  if (catalogRevision !== currentRevision) {
+    catalogRevision = currentRevision;
+    catalogIndex = undefined;
+    catalogResultCache.clear();
+  }
   if (catalogIndex) {
     return catalogIndex;
   }
@@ -182,7 +206,10 @@ function buildCatalogIndex(payload: unknown, loadedFrom: string): CatalogIndex {
       continue;
     }
 
-    const sourceRecords = Array.isArray(item.sourceRecords) ? item.sourceRecords : [];
+    // Direct provider records precede aggregators for the same exact model ID.
+    const sourceRecords = Array.isArray(item.sourceRecords) ? [...item.sourceRecords].sort((a, b) =>
+      Number(isRecord(b) && b.source === b.provider) - Number(isRecord(a) && a.source === a.provider)
+    ) : [];
     for (const sourceRecord of sourceRecords) {
       if (!isRecord(sourceRecord)) {
         continue;
@@ -255,8 +282,13 @@ function providerModelMetadataFromCatalog(
   model: string
 ): ProviderModelMetadata | undefined {
   const limits = isRecord(modelEntry.limits) ? modelEntry.limits : {};
-  const contextWindow = maxPositiveInteger(limits.contextTokens, limits.inputTokens, limits.maxTokens);
-  const maxOutputTokens = maxPositiveInteger(limits.outputTokens, limits.maxTokens);
+  const sourceMetadata = isRecord(sourceRecord.metadata) ? sourceRecord.metadata : {};
+  const topProvider = provider === "openrouter" && sourceRecord.source === "openrouter" && isRecord(sourceMetadata.topProvider)
+    ? sourceMetadata.topProvider : {};
+  const contextWindow = maxPositiveInteger(topProvider.context_length) ??
+    maxPositiveInteger(limits.contextTokens, limits.inputTokens, limits.maxTokens);
+  const maxOutputTokens = maxPositiveInteger(topProvider.max_completion_tokens) ??
+    maxPositiveInteger(limits.outputTokens, limits.maxTokens);
   const capabilities = isRecord(modelEntry.capabilities) ? modelEntry.capabilities : {};
   const imageInput = booleanValue(capabilities.imageInput);
   const webSearch = booleanValue(capabilities.webSearch);

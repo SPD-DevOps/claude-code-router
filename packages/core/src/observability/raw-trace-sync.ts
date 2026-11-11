@@ -9,6 +9,7 @@ import type { AppConfig } from "@ccr/core/contracts/app";
 import { RAW_TRACE_SPOOL_DIR } from "@ccr/core/config/constants";
 import {
   enqueueGatewayRequestLogFromRawTrace,
+  type RequestLogRawTraceFile,
   type RequestLogRawTraceFiles,
   type RequestLogRawTraceUpdateInput
 } from "@ccr/core/observability/request-log-store";
@@ -18,10 +19,14 @@ import {
 } from "@ccr/core/observability/request-log-runtime";
 import { rawTraceMaxPartBytes, resolveRawTraceBodyLimit } from "@ccr/core/observability/request-log-limits";
 import { isRecord, numberValue, stringValue } from "@ccr/core/gateway/internal/value";
-import { formatError, parseJsonObject, readHeader, readRequestBody, sendJson } from "@ccr/core/gateway/http/io";
+import { formatError, inferGatewayClient, parseJsonObject, readHeader, readRequestBody, sendJson, shouldCaptureGatewayUsage } from "@ccr/core/gateway/http/io";
 import { endpoint } from "@ccr/core/gateway/core-runtime/supervisor";
 import { maxUsageCaptureBytes, rawTraceSyncHeader, rawTraceSyncPath } from "@ccr/core/gateway/internal/shared";
 import type { RawTracePartText } from "@ccr/core/gateway/internal/shared";
+import { resolveResponseProviderProtocol } from "@ccr/core/providers/runtime-topology";
+import { recordGatewayUsageCaptureIfMissing } from "@ccr/core/usage/store";
+import { modelRegistryForConfig } from "@ccr/core/routing/model-registry";
+import { providerModelPricingForUsage } from "@ccr/core/models/pricing-service";
 
 type RawTraceSynchronizerDependencies = {
   enqueueUpdate?: (
@@ -34,6 +39,7 @@ type RawTraceSynchronizerDependencies = {
   deadLetterMaxBytes?: number;
   deadLetterRetentionMs?: number;
   getConfig: () => AppConfig | undefined;
+  allowStandaloneRequestLogs?: () => boolean;
   inboxMaxBundles?: number;
   inboxMaxBytes?: number;
   measureDirectorySize?: (directory: string) => Promise<number>;
@@ -146,6 +152,8 @@ export class RawTraceSynchronizer {
   private storageReady = false;
   private sourceScanGeneration = 0;
   private readonly sourceObservations = new Map<string, RawTraceSourceObservation>();
+  // Uploads, source/staging recovery, and retention must not move the same
+  // directory while another operation is still making its durable publication.
   private storageMutation = Promise.resolve();
 
   constructor(private readonly dependencies: RawTraceSynchronizerDependencies) {}
@@ -202,12 +210,12 @@ export class RawTraceSynchronizer {
     }
     let stored: StoredRawTraceBundle;
     try {
-      stored = await persistRawTraceBundle(
+      stored = await this.withStorageMutation(() => persistRawTraceBundle(
         manifest,
         spoolDirectory,
         this.dependencies.syncPartFile,
         this.dependencies.measureDirectorySize
-      );
+      ));
     } catch (error) {
       console.warn(`[gateway] Failed to durably accept raw trace bundle: ${formatError(error)}`);
       sendJson(response, 503, { accepted: false, ok: false, reason: "spool_unavailable" });
@@ -370,9 +378,10 @@ export class RawTraceSynchronizer {
       return true;
     }
 
+    let deliveryAttemptStarted = false;
     try {
       const config = this.dependencies.getConfig();
-      if (!config || !shouldRecordRequestLogs(config)) {
+      if (!config) {
         await this.cleanupStoredBundle(stored);
         this.retryStates.delete(stored.bundleId);
         return true;
@@ -386,12 +395,32 @@ export class RawTraceSynchronizer {
         this.retryStates.delete(stored.bundleId);
         return true;
       }
-      const policy = applyRawTraceRequestLogPolicy(config, bundle.update);
+      await recordUsageCaptureFromRawTrace(config, bundle.update, bundle.files);
+      if (!shouldRecordRequestLogs(config)) {
+        await this.cleanupStoredBundle(stored);
+        this.retryStates.delete(stored.bundleId);
+        return true;
+      }
+      const standaloneRequestLog = this.dependencies.allowStandaloneRequestLogs?.() === true;
+      const policy = applyRawTraceRequestLogPolicy(config, {
+        ...bundle.update,
+        ...(standaloneRequestLog ? { allowStandaloneRecord: true } : {})
+      });
       const maxBodyBytes = resolveRawTraceBodyLimit(config.observability.requestLogMaxBodyBytes);
       const files = policy.bodyDisposition === "suppress"
         ? { cleanupDirectory: bundle.files.cleanupDirectory, maxBodyBytes }
         : { ...bundle.files, maxBodyBytes };
       const enqueueUpdate = this.dependencies.enqueueUpdate ?? enqueueGatewayRequestLogFromRawTrace;
+      // Persist before handing ownership to the writer: a successful enqueue
+      // can be committed and its directory removed immediately. Writing after
+      // enqueue races that cleanup and loses retry budgets on worker crashes.
+      stored.delivery = {
+        ...stored.delivery,
+        attempts: stored.delivery.attempts + 1,
+        lastAttemptAt: now
+      };
+      deliveryAttemptStarted = true;
+      await writeDurableDeliveryState(stored.directory, stored.delivery);
       const enqueueResult = await enqueueUpdate(policy.update, files);
       const result: RequestLogEnqueueResult = typeof enqueueResult === "boolean"
         ? { accepted: enqueueResult, degraded: false, ...(enqueueResult ? {} : { reason: "queue_full" }) }
@@ -404,8 +433,6 @@ export class RawTraceSynchronizer {
         const pendingAttempts = retryState.pendingAttempts + 1;
         stored.delivery = {
           ...stored.delivery,
-          attempts: stored.delivery.attempts + 1,
-          lastAttemptAt: now,
           lastError: "record_pending"
         };
         this.retryStates.set(stored.bundleId, {
@@ -416,17 +443,13 @@ export class RawTraceSynchronizer {
           ),
           pendingAttempts
         });
-        // Persist the transition once so restart diagnostics retain the reason,
-        // but keep subsequent attempt counters in memory to avoid fsync on
-        // every admission poll.
+        // Attempt counts are already durable; persist the reason on transition.
         if (previousError !== "record_pending") {
           await writeDurableDeliveryState(stored.directory, stored.delivery);
         }
       } else if (!result.accepted) {
         stored.delivery = {
           ...stored.delivery,
-          attempts: stored.delivery.attempts + 1,
-          lastAttemptAt: now,
           lastError: result.reason ?? "enqueue_rejected"
         };
         this.retryStates.set(stored.bundleId, {
@@ -437,8 +460,6 @@ export class RawTraceSynchronizer {
       } else {
         stored.delivery = {
           ...stored.delivery,
-          attempts: stored.delivery.attempts + 1,
-          lastAttemptAt: now,
           lastError: undefined
         };
         this.retryStates.set(stored.bundleId, {
@@ -450,7 +471,7 @@ export class RawTraceSynchronizer {
     } catch (error) {
       stored.delivery = {
         ...stored.delivery,
-        attempts: stored.delivery.attempts + 1,
+        attempts: stored.delivery.attempts + (deliveryAttemptStarted ? 0 : 1),
         lastAttemptAt: now,
         lastError: formatError(error)
       };
@@ -552,12 +573,12 @@ export class RawTraceSynchronizer {
     for await (const directory of iterateRawTraceStagingDirectories(this.spoolDirectory())) {
       if (!await pathExists(join(directory, rawTraceReadyFileName))) continue;
       try {
-        await publishStagedRawTraceBundle(
+        await this.withStorageMutation(() => publishStagedRawTraceBundle(
           directory,
           this.spoolDirectory(),
           this.dependencies.syncPartFile,
           this.dependencies.measureDirectorySize
-        );
+        ));
       } catch (error) {
         console.warn(`[gateway] Failed to publish recovered raw trace staging ${directory}: ${formatError(error)}`);
       }
@@ -592,12 +613,12 @@ export class RawTraceSynchronizer {
           }
           continue;
         }
-        const stored = await persistRawTraceBundle(
+        const stored = await this.withStorageMutation(() => persistRawTraceBundle(
           manifest,
           this.spoolDirectory(),
           this.dependencies.syncPartFile,
           this.dependencies.measureDirectorySize
-        );
+        ));
         this.sourceObservations.delete(directory);
         await this.registerStoredBundle(stored);
       } catch (error) {
@@ -611,12 +632,12 @@ export class RawTraceSynchronizer {
     for await (const directory of iterateRawTraceStagingDirectories(this.spoolDirectory())) {
       try {
         if (await pathExists(join(directory, rawTraceReadyFileName))) {
-          const stored = await publishStagedRawTraceBundle(
+          const stored = await this.withStorageMutation(() => publishStagedRawTraceBundle(
             directory,
             this.spoolDirectory(),
             this.dependencies.syncPartFile,
             this.dependencies.measureDirectorySize
-          );
+          ));
           this.sourceObservations.delete(directory);
           await this.registerStoredBundle(stored);
           continue;
@@ -1004,6 +1025,14 @@ async function writeDurableManifest(
   directory: string,
   manifest: Record<string, unknown>
 ): Promise<void> {
+  // Retrying an unchanged manifest must not look like fresh producer activity
+  // to the abandoned-source sweep. fsync still precedes any durable ACK.
+  const existing = await readManifestFile(directory);
+  if (existing && JSON.stringify(existing) === JSON.stringify(manifest)) {
+    await syncFile(join(directory, "manifest.json"));
+    await syncDirectory(directory);
+    return;
+  }
   await writeDurableJsonFile(directory, "manifest.json", manifest);
 }
 
@@ -1407,16 +1436,26 @@ function pendingRetryDelayMs(baseMs: number, maxMs: number, pendingAttempts: num
 }
 
 
-export function buildRawTraceConfig(config: AppConfig, rawTraceSyncToken: string): Record<string, unknown> {
+export function buildRawTraceConfig(
+  config: AppConfig,
+  rawTraceSyncToken: string,
+  options: { standaloneUsageCapture?: boolean } = {}
+): Record<string, unknown> {
   const bodyCapture = config.observability.requestLogBodyCapture ?? "all";
   const maxBodyBytes = resolveRawTraceBodyLimit(config.observability.requestLogMaxBodyBytes);
   const bodyCaptureEnabled = bodyCapture !== "none" && maxBodyBytes >= 1024;
-  const enabled = rawTraceEnabledFromEnv() && shouldRecordRequestLogs(config) && bodyCaptureEnabled;
+  const requestLogsEnabled = shouldRecordRequestLogs(config);
+  const standaloneUsageCapture = options.standaloneUsageCapture === true;
+  const enabled = !rawTraceDisabledFromEnv() && (
+    standaloneUsageCapture ||
+    (requestLogsEnabled && bodyCaptureEnabled)
+  );
+  const mode = requestLogsEnabled && bodyCaptureEnabled ? "wire_raw" : "body_redacted";
   return {
     deleteLocalAfterUpload: false,
     enabled,
     maxPartBytes: rawTraceMaxPartBytes,
-    mode: "wire_raw",
+    mode,
     spoolDir: RAW_TRACE_SPOOL_DIR,
     sync: {
       enabled,
@@ -1460,6 +1499,8 @@ export function applyRawTraceRequestLogPolicy(
         : "defer";
   const policyInput: RequestLogRawTraceUpdateInput = {
     ...input,
+    provider: modelRegistryForConfig(config).findProvider(input.provider)?.name ?? input.provider,
+    pricing: providerModelPricingForUsage(config, input.provider, input.model),
     bodyCapturePolicy,
     // An upstream trace never owns the final request outcome. Even an HTTP 2xx
     // can be followed by a downstream disconnect or response write failure.
@@ -1483,6 +1524,78 @@ export function rawTraceRequestOutcome(
   return "unknown";
 }
 
+async function recordUsageCaptureFromRawTrace(
+  config: AppConfig,
+  input: RequestLogRawTraceUpdateInput,
+  files: RequestLogRawTraceFiles
+): Promise<void> {
+  const method = input.method ?? "POST";
+  const path = input.path ?? pathFromUrl(input.url) ?? "/";
+  if (!shouldCaptureGatewayUsage(method, path)) {
+    return;
+  }
+
+  const responseHeaders = headersFromRawTrace(input.responseHeaders);
+  await recordGatewayUsageCaptureIfMissing({
+    bodyText: await rawTraceUsageBodyText(input, files.responseBody),
+    config,
+    durationMs: numberValue(input.durationMs) ?? 0,
+    fallbackModel: input.model,
+    method,
+    path,
+    providerName: input.provider,
+    providerProtocol: resolveResponseProviderProtocol(responseHeaders, config),
+    requestId: input.requestId,
+    responseHeaders,
+    statusCode: numberValue(input.statusCode) ?? 0
+  });
+}
+
+async function rawTraceUsageBodyText(
+  input: RequestLogRawTraceUpdateInput,
+  file: RequestLogRawTraceFile | undefined
+): Promise<string> {
+  if (input.responseBodyText !== undefined) {
+    return boundedText(input.responseBodyText, maxUsageCaptureBytes);
+  }
+  if (!file || !isUsageTextContentType(file.contentType)) {
+    return "";
+  }
+  try {
+    return boundedText(await readFile(file.filePath, "utf8"), maxUsageCaptureBytes);
+  } catch {
+    return "";
+  }
+}
+
+function boundedText(value: string, maxBytes: number): string {
+  const buffer = Buffer.from(value);
+  return buffer.byteLength > maxBytes
+    ? buffer.subarray(0, maxBytes).toString("utf8")
+    : value;
+}
+
+function headersFromRawTrace(headers: RequestLogRawTraceUpdateInput["responseHeaders"]): Headers {
+  const result = new Headers();
+  for (const [key, value] of Object.entries(headers ?? {})) {
+    if (Array.isArray(value)) {
+      for (const item of value) result.append(key, item);
+    } else if (value !== undefined) {
+      result.set(key, value);
+    }
+  }
+  return result;
+}
+
+function isUsageTextContentType(contentType: string | undefined): boolean {
+  if (!contentType) return true;
+  const normalized = contentType.toLowerCase();
+  return normalized.includes("json") ||
+    normalized.includes("text") ||
+    normalized.includes("xml") ||
+    normalized.includes("event-stream");
+}
+
 
 export function requestLogSampled(requestId: string, rate: number): boolean {
   if (rate >= 1) return true;
@@ -1496,9 +1609,9 @@ export function requestLogSampled(requestId: string, rate: number): boolean {
 }
 
 
-function rawTraceEnabledFromEnv(): boolean {
+function rawTraceDisabledFromEnv(): boolean {
   const value = (process.env.CCR_RAW_TRACE_ENABLED ?? process.env.CCR_RAW_TRACE ?? "").trim().toLowerCase();
-  return value === "1" || value === "true" || value === "yes" || value === "on";
+  return value === "0" || value === "false" || value === "no" || value === "off";
 }
 
 
@@ -1534,8 +1647,11 @@ export async function readRawTraceRequestLogBundle(
   const target = isRecord(manifest.target) ? manifest.target : {};
   const rawUrl = stringValue(upstreamRequestMetadata?.url);
   const url = sanitizeUrlForLog(rawUrl);
+  const clientRequestHeaders = headerRecordFromUnknown(clientRequestMetadata?.headers);
+  const upstreamRequestHeaders = headerRecordFromUnknown(upstreamRequestMetadata?.headers);
+  const client = inferGatewayClient(undefined, clientRequestHeaders ?? {});
   const attempt = positiveAttemptNumber(readUnknownHeader(
-    clientRequestMetadata?.headers,
+    clientRequestHeaders,
     "x-ccr-route-attempt"
   ));
 
@@ -1549,6 +1665,9 @@ export async function readRawTraceRequestLogBundle(
       ...(attempt === undefined ? {} : { attempt }),
       ...(stringValue(manifest.uploadedAt) ? { bundleCapturedAt: stringValue(manifest.uploadedAt) } : {}),
       ...(bundleId ? { bundleId } : {}),
+      ...(client ? { client } : {}),
+      ...(stringValue(manifest.completedAt) ? { completedAt: stringValue(manifest.completedAt) } : {}),
+      ...(numberValue(manifest.durationMs) !== undefined ? { durationMs: numberValue(manifest.durationMs) } : {}),
       method: stringValue(upstreamRequestMetadata?.method) || "POST",
       model: stringValue(target.model),
       path: pathFromUrl(url),
@@ -1556,13 +1675,14 @@ export async function readRawTraceRequestLogBundle(
       requestBodyContentType: upstreamRequestBody?.contentType,
       requestBodySizeBytes: upstreamRequestBody?.sizeBytes,
       requestBodyTruncated: upstreamRequestBody?.truncated,
-      requestHeaders: headerRecordFromUnknown(upstreamRequestMetadata?.headers),
+      requestHeaders: upstreamRequestHeaders,
       requestId,
       isStream: upstreamResponseStream !== undefined,
       responseBodyContentType: upstreamResponseBody?.contentType,
       responseBodySizeBytes: upstreamResponseBody?.sizeBytes,
       responseBodyTruncated: upstreamResponseBody?.truncated,
       responseHeaders: headerRecordFromUnknown(upstreamResponseMetadata?.headers),
+      ...(stringValue(manifest.startedAt) ? { startedAt: stringValue(manifest.startedAt) } : {}),
       statusCode: numberValue(upstreamResponseMetadata?.statusCode),
       url
     }

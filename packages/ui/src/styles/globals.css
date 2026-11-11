@@ -1298,6 +1298,15 @@
     background: var(--network-error-bg);
   }
 
+  .network-dot-unknown {
+    background: var(--network-text-muted);
+  }
+
+  .network-state-pill-unknown {
+    background: var(--network-panel-muted);
+    color: var(--network-text-muted);
+  }
+
   .network-method-pill {
     background: var(--network-panel-muted);
     color: var(--network-text);
@@ -1585,5 +1594,16 @@
     .onboarding-mascot-sprite {
       animation-duration: 1ms;
     }
+  }
+}
+
+@media (max-height: 760px) {
+  .onboarding-step-heading {
+    flex-direction: row;
+    justify-content: center;
+    text-align: left;
+  }
+  .onboarding-step-heading .onboarding-mascot-sprite {
+    display: none;
   }
 }

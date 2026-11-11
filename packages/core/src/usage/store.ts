@@ -8,7 +8,8 @@ import { REQUEST_LOGS_DB_FILE, USAGE_DB_FILE } from "@ccr/core/config/constants"
 import { estimateUsageCostUsd, providerModelPricingForUsage } from "@ccr/core/models/pricing-service";
 import { createBetterSqliteDatabase, type BetterSqliteDatabase } from "@ccr/core/storage/sqlite-native";
 import { normalizeUsageInputTokens } from "@ccr/core/usage/normalization";
-import { resolveUsageModelAttribution } from "@ccr/core/usage/model-attribution";
+import { isKnownProviderSelector, resolveUsageModelAttribution } from "@ccr/core/usage/model-attribution";
+import { modelRegistryForConfig } from "@ccr/core/routing/model-registry";
 import type {
   AppConfig,
   GatewayProviderProtocol,
@@ -17,6 +18,7 @@ import type {
   UsageStatsFilter,
   UsageSeriesPoint,
   UsageStatsRange,
+  UsageStatsResetResult,
   UsageStatsSnapshot,
   UsageTotals
 } from "@ccr/core/contracts/app";
@@ -111,6 +113,7 @@ type UsageSnapshot = UsageNumbers & {
 
 const usageEvents = new EventEmitter();
 const usageStatsRanges = new Set<UsageStatsRange>(["today", "24h", "7d", "30d"]);
+const usageStatsResetAtKey = "usage_stats_reset_at";
 const emptyTotals: UsageTotals = {
   avgDurationMs: 0,
   cacheRatio: 0,
@@ -237,13 +240,16 @@ export class UsageStore {
     const fallbackAttribution = resolveUsageModelAttribution(input.config, input.fallbackModel);
     const responseAttribution = resolveUsageResponseModelAttribution(input.config, bodyUsage?.model);
     const route = splitRouteSelector(input.fallbackModel);
-    const provider =
+    const reportedProvider =
       input.providerName ??
       readHeader(input.responseHeaders, "x-gateway-target-provider-name") ??
       readHeader(input.responseHeaders, "x-gateway-target-provider") ??
       responseAttribution.provider ??
       fallbackAttribution.provider ??
       route.provider;
+    const provider = input.config
+      ? modelRegistryForConfig(input.config).findProvider(reportedProvider)?.name ?? reportedProvider
+      : reportedProvider;
     const model = responseAttribution.model ?? fallbackAttribution.model ?? route.model ?? input.fallbackModel;
 
     await this.record({
@@ -255,7 +261,13 @@ export class UsageStore {
       path: input.path,
       client: input.client,
       provider,
-      pricing: providerModelPricingForUsage(input.config, provider, model),
+      // Price the model that actually served the request. After a rewrite or
+      // fallback the display model is still the requested alias.
+      pricing: providerModelPricingForUsage(
+        input.config,
+        provider,
+        fallbackAttribution.model ?? input.fallbackModel ?? model
+      ),
       credentialId: readCredentialId(input.responseHeaders),
       requestId: input.requestId,
       statusCode: input.statusCode,
@@ -302,6 +314,25 @@ export class UsageStore {
     return readUsageTotals(database, buildUsageWhereClause(since, filter, options));
   }
 
+  async resetStatistics(): Promise<UsageStatsResetResult> {
+    const database = await this.getDatabase();
+    const resetAt = new Date().toISOString();
+    let deletedEvents = 0;
+
+    database.transaction(() => {
+      const result = database.prepare("DELETE FROM usage_events").run();
+      deletedEvents = Number(result.changes);
+      database.prepare(`
+        INSERT INTO usage_metadata (key, value)
+        VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+      `).run(usageStatsResetAtKey, resetAt);
+    })();
+
+    usageEvents.emit("recorded");
+    return { deletedEvents, resetAt };
+  }
+
   private async getDatabase(): Promise<SqlDatabase> {
     if (this.database) {
       return this.database;
@@ -342,6 +373,10 @@ export class UsageStore {
       CREATE INDEX IF NOT EXISTS usage_events_model_idx ON usage_events(model);
       CREATE INDEX IF NOT EXISTS usage_events_path_idx ON usage_events(path);
       CREATE INDEX IF NOT EXISTS usage_events_request_id_idx ON usage_events(request_id);
+      CREATE TABLE IF NOT EXISTS usage_metadata (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
     `);
     ensureUsageSchema(database);
 
@@ -354,14 +389,15 @@ export class UsageStore {
     if (!requestLogDbFile || !existsSync(requestLogDbFile)) {
       return;
     }
+    const backfillSince = usageBackfillSinceAfterReset(database, since);
 
     let tempRequestLogDbFile: string | undefined;
     try {
       try {
-        this.backfillFromAttachedRequestLog(database, requestLogDbFile, since);
+        this.backfillFromAttachedRequestLog(database, requestLogDbFile, backfillSince);
       } catch {
         tempRequestLogDbFile = copySqliteDatabaseToTemp(requestLogDbFile);
-        this.backfillFromAttachedRequestLog(database, tempRequestLogDbFile, since);
+        this.backfillFromAttachedRequestLog(database, tempRequestLogDbFile, backfillSince);
       }
       this.requestLogBackfillFailureLogged = false;
     } catch (error) {
@@ -496,6 +532,15 @@ export async function getUsageStats(range?: UsageStatsRange | null, filter?: Usa
   }
 }
 
+export async function resetOverviewStatistics(): Promise<UsageStatsResetResult> {
+  try {
+    return await usageStore.resetStatistics();
+  } catch (error) {
+    console.warn(`[usage] Failed to reset overview statistics: ${formatError(error)}`);
+    throw error;
+  }
+}
+
 export async function getTodayUsageTotals(filter?: UsageStatsFilter | null, options?: UsageStatsQueryOptions | null): Promise<UsageTotals> {
   try {
     return await usageStore.getTotalsSince(floorDay(new Date()), filter, options);
@@ -522,6 +567,18 @@ export async function recordGatewayUsageCapture(input: UsageCaptureInput): Promi
   }
 }
 
+export async function recordGatewayUsageCaptureIfMissing(input: UsageCaptureInput): Promise<void> {
+  try {
+    const requestId = input.requestId?.trim();
+    if (requestId && await usageStore.hasRequestId(requestId)) {
+      return;
+    }
+    await usageStore.recordCapture(input);
+  } catch (error) {
+    console.warn(`[usage] Failed to record usage: ${formatError(error)}`);
+  }
+}
+
 function resolveUsageResponseModelAttribution(
   config: Pick<AppConfig, "Providers" | "virtualModelProfiles"> | undefined,
   model: string | undefined
@@ -530,6 +587,18 @@ function resolveUsageResponseModelAttribution(
   if (decodedClaudeRouteModel) {
     const attribution = resolveUsageModelAttribution(config, decodedClaudeRouteModel);
     return !config || attribution.provider ? attribution : {};
+  }
+  if (config && model && isKnownProviderSelector(config, model)) {
+    // The gateway rewrites the response model back to the selector the client
+    // requested, so a "provider/model" string here is a client-visible route
+    // selector, not the physical model. Attribute through the selector so
+    // per-model stats aggregate on the bare model name the provider is
+    // configured with; physical echoes (unknown provider or no slash) still
+    // fall through and are kept verbatim.
+    const attribution = resolveUsageModelAttribution(config, model);
+    if (attribution.provider) {
+      return attribution;
+    }
   }
   return resolveUsageModelAttribution(config, model, { physicalModel: true });
 }
@@ -599,6 +668,23 @@ function queryRows(database: SqlDatabase, sql: string, params: SqlValue[] = []):
   return database.prepare(sql).all(...params) as Record<string, SqlValue>[];
 }
 
+function usageBackfillSinceAfterReset(database: SqlDatabase, since: Date): Date {
+  const resetAt = readUsageStatsResetAt(database);
+  if (!resetAt || resetAt.getTime() < since.getTime()) {
+    return since;
+  }
+  return new Date(resetAt.getTime() + 1);
+}
+
+function readUsageStatsResetAt(database: SqlDatabase): Date | undefined {
+  const row = queryRows(database, "SELECT value FROM usage_metadata WHERE key = ? LIMIT 1", [usageStatsResetAtKey])[0];
+  if (typeof row?.value !== "string") {
+    return undefined;
+  }
+  const date = new Date(row.value);
+  return Number.isFinite(date.getTime()) ? date : undefined;
+}
+
 function sqlString(value: string): string {
   return `'${value.replace(/'/g, "''")}'`;
 }
@@ -658,6 +744,7 @@ const usageTotalsSelect = `
             COALESCE(SUM(COALESCE(cost_usd, 0)), 0) AS cost_usd,
             COALESCE(SUM(duration_ms), 0) AS duration_ms,
             COALESCE(SUM(CASE WHEN status_code >= 200 AND status_code < 400 THEN 1 ELSE 0 END), 0) AS success_count,
+            COALESCE(SUM(CASE WHEN status_code > 0 AND (status_code < 200 OR status_code >= 400) THEN 1 ELSE 0 END), 0) AS error_count,
             COALESCE(SUM(CASE
               WHEN total_tokens - output_tokens > input_tokens + cache_read_tokens + cache_write_tokens THEN total_tokens - output_tokens
               ELSE input_tokens + cache_read_tokens + cache_write_tokens
@@ -844,6 +931,7 @@ function usageTotalsFromRow(row: Record<string, SqlValue> | undefined): UsageTot
     return { ...emptyTotals };
   }
   const successfulRequests = normalizeCount(row?.success_count);
+  const errorCount = normalizeCount(row?.error_count);
   const promptTokens = normalizeCount(row?.prompt_tokens);
   const cacheTokens = normalizeCount(row?.cache_read_tokens);
   return {
@@ -851,11 +939,11 @@ function usageTotalsFromRow(row: Record<string, SqlValue> | undefined): UsageTot
     cacheRatio: ratio(cacheTokens, promptTokens),
     cacheTokens,
     costUsd: normalizeCost(row?.cost_usd),
-    errorCount: requestCount - successfulRequests,
+    errorCount,
     inputTokens: normalizeCount(row?.input_tokens),
     outputTokens: normalizeCount(row?.output_tokens),
     requestCount,
-    successRate: successfulRequests / requestCount,
+    successRate: ratio(successfulRequests, successfulRequests + errorCount),
     totalTokens: normalizeCount(row?.computed_total_tokens)
   };
 }
@@ -952,7 +1040,7 @@ function buildTotals(events: StoredUsageEvent[]): UsageTotals {
   const totalTokens = sum(events, totalTokenCount);
   const promptTokens = sum(events, promptTokenCount);
   const successfulRequests = events.filter((event) => event.statusCode >= 200 && event.statusCode < 400).length;
-  const errorCount = requestCount - successfulRequests;
+  const errorCount = events.filter((event) => event.statusCode > 0 && (event.statusCode < 200 || event.statusCode >= 400)).length;
 
   return {
     avgDurationMs: Math.round(sum(events, (event) => event.durationMs) / requestCount),
@@ -963,7 +1051,7 @@ function buildTotals(events: StoredUsageEvent[]): UsageTotals {
     inputTokens,
     outputTokens,
     requestCount,
-    successRate: successfulRequests / requestCount,
+    successRate: ratio(successfulRequests, successfulRequests + errorCount),
     totalTokens
   };
 }
@@ -1096,6 +1184,7 @@ function extractUsageSnapshot(payload: unknown): UsageSnapshot | undefined {
     inputDetails?.cached_tokens !== undefined ||
     inputDetails?.cache_creation_tokens !== undefined ||
     usage.cached_tokens !== undefined ||
+    usage.prompt_cache_hit_tokens !== undefined ||
     usage.prompt_tokens !== undefined;
   const cacheCreation = isRecord(usage.cache_creation) ? usage.cache_creation : undefined;
   const cacheWrite5mTokens = asNumber(cacheCreation?.ephemeral_5m_input_tokens);
@@ -1106,7 +1195,8 @@ function extractUsageSnapshot(payload: unknown): UsageSnapshot | undefined {
       asNumber(usage.cache_read_tokens) ??
       asNumber(usage.cache_read_input_tokens) ??
       asNumber(usage.cached_tokens) ??
-      asNumber(inputDetails?.cached_tokens),
+      asNumber(inputDetails?.cached_tokens) ??
+      asNumber(usage.prompt_cache_hit_tokens),
     cacheWrite1hTokens,
     cacheWrite5mTokens,
     cacheWriteTokens:

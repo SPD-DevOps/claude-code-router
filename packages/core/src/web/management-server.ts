@@ -1,3 +1,4 @@
+import { refreshModelCatalog } from "@ccr/core/models/catalog-file";
 import { spawn } from "node:child_process";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
@@ -10,8 +11,7 @@ import { loadOnboardingFinished, markOnboardingFinished } from "@ccr/core/config
 import { scanBotHandoffBluetoothTargets, scanBotHandoffWifiTargets } from "@ccr/core/agents/bot-gateway/handoff-scan-service";
 import { cancelBotGatewayQrLogin, startBotGatewayQrLogin, waitBotGatewayQrLogin } from "@ccr/core/agents/bot-gateway/qr-login-service";
 import { syncClaudeAppGatewayConfig, restoreClaudeAppGatewayConfig } from "@ccr/core/agents/claude-app/gateway-service";
-import { findInstalledCodexAppExecutable, findInstalledWorkbuddyAppExecutable } from "@ccr/core/agents/codex/app-launch";
-import { findInstalledOpenCodeAppExecutable } from "@ccr/core/agents/opencode/app-launch";
+import { getAppInfoPaths } from "@ccr/core/agents/app-info-paths";
 import { loadAppConfig, saveApiKeysConfig, saveAppConfig } from "@ccr/core/config/config";
 import {
   APP_CONFIG_DB_FILE,
@@ -43,7 +43,7 @@ import { proxyService } from "@ccr/core/proxy/service";
 import { listMcpServerTools } from "@ccr/core/mcp/tool-discovery";
 import { closeRequestLogRuntime, getAgentAnalysis, getAgentTracePayload, getRequestLogBodyChunk, getRequestLogDetail, getRequestLogs } from "@ccr/core/observability/request-log-store";
 import { shouldRecordRequestLogs } from "@ccr/core/observability/raw-trace-sync";
-import { getUsageStats } from "@ccr/core/usage/store";
+import { getUsageStats, resetOverviewStatistics } from "@ccr/core/usage/store";
 import { gatewayService } from "@ccr/core/gateway/service";
 import { shouldRestartGatewayForRuntimeConfigChange } from "@ccr/core/gateway/runtime-change";
 import { getProviderAccountSnapshots, invalidateProviderAccountSnapshotCache, resetCodexRateLimitCredit, testProviderAccountConnector } from "@ccr/core/providers/account-service";
@@ -133,6 +133,7 @@ const webBridgeScriptTag = '    <script src="../../assets/web-client-bridge.js">
 
 
 export async function startWebManagementServer(options: WebManagementServerOptions = {}): Promise<WebManagementServerRuntime> {
+  await refreshModelCatalog();
   const host = options.host?.trim() || readEnvString("CCR_WEB_HOST") || defaultWebHost;
   const requestedPort = options.port ?? readEnvPort("CCR_WEB_PORT") ?? defaultWebPort;
   const authToken = options.authToken?.trim() || readEnvString("CCR_WEB_AUTH_TOKEN") || randomBytes(32).toString("base64url");
@@ -247,7 +248,7 @@ async function handleRpcRequest(request: IncomingMessage, response: ServerRespon
     const value = await handler(...(Array.isArray(payload.args) ? payload.args : []));
     sendJson(response, 200, { ok: true, value });
   } catch (error) {
-    sendJson(response, 500, { error: { message: formatError(error) }, ok: false });
+    sendJson(response, error instanceof Error && error.name === "AppConfigConflictError" ? 409 : 500, { error: { message: formatError(error) }, ok: false });
   }
 }
 
@@ -413,6 +414,7 @@ const rpcHandlers: Record<string, RpcHandler> = {
     await revealFile(PROXY_CA_CERT_FILE);
   },
   resetCodexRateLimitCredit: (request) => resetCodexRateLimitCredit(request as ProviderAccountResetRequest),
+  resetOverviewStatistics: () => resetOverviewStatistics(),
   saveApiKeys: async (apiKeys) => {
     const savedConfig = await saveApiKeysConfig(apiKeys as ApiKeyConfig[]);
     const syncedClaudeAppConfig = await syncClaudeAppGatewayConfig(savedConfig);
@@ -553,9 +555,7 @@ function logProfileApplyResult(result: ProfileApplyResult): void {
 }
 
 function getCliAppInfo(): AppInfo {
-  const chatgptAppPath = findInstalledCodexAppExecutable().executable;
-  const opencodeAppPath = findInstalledOpenCodeAppExecutable().executable;
-  const workbuddyAppPath = findInstalledWorkbuddyAppExecutable().executable;
+  const { chatgptAppPath, opencodeAppPath, workbuddyAppPath } = getAppInfoPaths();
   return {
     ...(chatgptAppPath ? { chatgptAppPath } : {}),
     configDbFile: APP_CONFIG_DB_FILE,

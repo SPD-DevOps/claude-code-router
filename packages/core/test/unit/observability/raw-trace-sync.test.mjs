@@ -5,6 +5,7 @@ import path from "node:path";
 import { Readable } from "node:stream";
 import test from "node:test";
 import { createDefaultAppConfig } from "@ccr/core/config/default-config.ts";
+import { providerRuntimeId } from "@ccr/core/routing/model-registry.ts";
 import { rawTraceSyncHeader } from "@ccr/core/gateway/internal/shared.ts";
 import { rawTraceHardMaxBodyBytes, rawTraceMaxPartBytes } from "@ccr/core/observability/request-log-limits.ts";
 import {
@@ -15,6 +16,18 @@ import {
   readRawTraceRequestLogBundle,
   RawTraceSynchronizer
 } from "@ccr/core/observability/raw-trace-sync.ts";
+
+test("#1809 raw trace resolves runtime provider aliases and custom pricing", () => {
+  const config = createConfig();
+  const pricing = { inputUsdPerMillionTokens: 2, outputUsdPerMillionTokens: 6 };
+  const provider = { name: "Local Ollama", type: "openai_chat_completions", baseUrl: "http://localhost:11434/v1", models: ["local-model"], modelMetadata: { "local-model": { pricing } } };
+  config.Providers = [provider];
+  const policy = applyRawTraceRequestLogPolicy(config, {
+    model: "local-model", provider: `${providerRuntimeId(provider)}::openai_chat_completions`, requestId: "local-alias", statusCode: 200
+  });
+  assert.equal(policy.update.provider, "Local Ollama");
+  assert.deepEqual(policy.update.pricing, pricing);
+});
 
 test("raw trace applies metadata-only body privacy while retaining original sizes", () => {
   const config = createConfig();
@@ -119,33 +132,72 @@ test("raw trace defers body persistence when the upstream status is unknown", ()
 
 test("raw trace source keeps raw body parts unbounded for sidecar storage", () => {
   const config = createConfig();
-  const previous = process.env.CCR_RAW_TRACE_ENABLED;
-  process.env.CCR_RAW_TRACE_ENABLED = "1";
+  const rawTrace = buildRawTraceConfig(config, "sync-token");
+  assert.equal(rawTrace.enabled, true);
+  assert.equal(rawTrace.mode, "wire_raw");
+  assert.equal(rawTrace.maxPartBytes, rawTraceMaxPartBytes);
+  assert.ok(rawTrace.maxPartBytes > rawTraceHardMaxBodyBytes);
+  config.observability.requestLogMaxBodyBytes = Number.MAX_SAFE_INTEGER;
+  assert.equal(buildRawTraceConfig(config, "sync-token").maxPartBytes, rawTraceMaxPartBytes);
+});
+
+test("raw trace capture is metadata-only for standalone usage when body logging is disabled", () => {
+  const config = createConfig();
+  config.observability.requestLogBodyCapture = "none";
+  assert.equal(buildRawTraceConfig(config, "sync-token").enabled, false);
+  const standalone = buildRawTraceConfig(config, "sync-token", { standaloneUsageCapture: true });
+  assert.equal(standalone.enabled, true);
+  assert.equal(standalone.mode, "body_redacted");
+
+  const previous = process.env.CCR_RAW_TRACE;
+  process.env.CCR_RAW_TRACE = "false";
   try {
-    const rawTrace = buildRawTraceConfig(config, "sync-token");
-    assert.equal(rawTrace.maxPartBytes, rawTraceMaxPartBytes);
-    assert.ok(rawTrace.maxPartBytes > rawTraceHardMaxBodyBytes);
-    config.observability.requestLogMaxBodyBytes = Number.MAX_SAFE_INTEGER;
-    assert.equal(buildRawTraceConfig(config, "sync-token").maxPartBytes, rawTraceMaxPartBytes);
+    assert.equal(buildRawTraceConfig(config, "sync-token", { standaloneUsageCapture: true }).enabled, false);
   } finally {
-    if (previous === undefined) delete process.env.CCR_RAW_TRACE_ENABLED;
-    else process.env.CCR_RAW_TRACE_ENABLED = previous;
+    if (previous === undefined) delete process.env.CCR_RAW_TRACE;
+    else process.env.CCR_RAW_TRACE = previous;
   }
 });
 
-test("raw trace capture is disabled at the source for metadata-only logging", () => {
-  const config = createConfig();
-  config.observability.requestLogBodyCapture = "none";
-  const previous = process.env.CCR_RAW_TRACE_ENABLED;
-  process.env.CCR_RAW_TRACE_ENABLED = "1";
+test("raw trace bundle preserves manifest lifecycle metadata", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "ccr-raw-trace-lifecycle-test-"));
+  const spoolDirectory = path.join(dir, "spool");
+  const bundleDirectory = path.join(spoolDirectory, "producer-bundle");
+  const clientMetadataFile = path.join(bundleDirectory, "client_request_metadata.json");
+  const bodyFile = path.join(bundleDirectory, "upstream_request.json");
+  const startedAt = "2026-08-26T01:02:03.004Z";
+  const completedAt = "2026-08-26T01:02:04.238Z";
+  mkdirSync(bundleDirectory, { recursive: true });
+  writeFileSync(clientMetadataFile, JSON.stringify({ headers: { "x-ccr-client": "opencode" } }));
+  writeFileSync(bodyFile, "{}");
   try {
-    assert.equal(buildRawTraceConfig(config, "sync-token").enabled, false);
-    config.observability.requestLogBodyCapture = "all";
-    config.observability.requestLogMaxBodyBytes = 0;
-    assert.equal(buildRawTraceConfig(config, "sync-token").enabled, false);
+    const bundle = await readRawTraceRequestLogBundle({
+      completedAt,
+      durationMs: 1234,
+      parts: [{
+        filePath: clientMetadataFile,
+        partType: "client_request_metadata"
+      }, {
+        contentType: "application/json",
+        filePath: bodyFile,
+        originalBytes: 2,
+        partType: "upstream_request"
+      }],
+      requestId: "core-bundle-lifecycle",
+      startedAt,
+      turnKey: "logical-lifecycle-request",
+      uploadedAt: completedAt
+    }, spoolDirectory);
+
+    assert.ok(bundle);
+    assert.equal(bundle.update.requestId, "logical-lifecycle-request");
+    assert.equal(bundle.update.client, "opencode");
+    assert.equal(bundle.update.startedAt, startedAt);
+    assert.equal(bundle.update.completedAt, completedAt);
+    assert.equal(bundle.update.durationMs, 1234);
+    assert.equal(bundle.update.bundleCapturedAt, completedAt);
   } finally {
-    if (previous === undefined) delete process.env.CCR_RAW_TRACE_ENABLED;
-    else process.env.CCR_RAW_TRACE_ENABLED = previous;
+    rmSync(dir, { force: true, recursive: true });
   }
 });
 
@@ -334,6 +386,7 @@ test("raw trace replay recovers an inbox bundle after the accepting process cras
     await first.handle(request, response);
     const inbox = path.join(spoolDirectory, ".ccr-inbox");
     await waitFor(() => readdirSync(inbox).length === 1);
+    await first.stop();
 
     let replayed = 0;
     const second = new RawTraceSynchronizer({
@@ -674,7 +727,7 @@ test("raw trace moves permanently pending bundles to bounded dead letter after m
   }
 });
 
-test("raw trace backs off record-pending retries without repeatedly persisting attempts", async () => {
+test("raw trace persists the delivery budget across record-pending retries", async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "ccr-raw-trace-pending-backoff-test-"));
   const spoolDirectory = path.join(dir, "spool");
   const bundleDirectory = path.join(spoolDirectory, "pending-backoff-bundle");
@@ -707,12 +760,12 @@ test("raw trace backs off record-pending retries without repeatedly persisting a
     const storedDirectory = path.join(inboxDirectory, readdirSync(inboxDirectory)[0]);
     const deliveryFile = path.join(storedDirectory, ".ccr-delivery.json");
     await waitFor(() => JSON.parse(readFileSync(deliveryFile, "utf8")).lastError === "record_pending");
-    const firstPersistedState = readFileSync(deliveryFile, "utf8");
 
-    await new Promise((resolve) => setTimeout(resolve, 80));
-    assert.ok(attempts >= 2);
-    assert.ok(attempts <= 3);
-    assert.equal(readFileSync(deliveryFile, "utf8"), firstPersistedState);
+    await waitFor(() => attempts >= 2);
+    // A retry reserves its budget before enqueue. Drain that work before
+    // comparing durable reservations with completed enqueue calls.
+    await synchronizer.stop();
+    assert.equal(JSON.parse(readFileSync(deliveryFile, "utf8")).attempts, attempts);
   } finally {
     await synchronizer.stop();
     rmSync(dir, { force: true, recursive: true });
@@ -743,18 +796,21 @@ test("raw trace replay rotates through a bounded number of bundles per pass", as
       return { accepted: false, degraded: false, reason: "record_pending" };
     },
     getConfig: createConfig,
-    replayIntervalMs: 50,
+    replayIntervalMs: 60_000,
     replayMaxBundlesPerPass: 2,
     replayTimeBudgetMs: 1_000,
     retryCooldownMs: 60_000,
     spoolDirectory
   });
   try {
-    await synchronizer.start();
-    await waitFor(() => attemptedBundleIds.length >= 2);
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    assert.equal(attemptedBundleIds.length, 2);
-    await waitFor(() => attemptedBundleIds.length === 5);
+    // Stop drains the startup pass. Restart the same synchronizer to exercise
+    // the next pass without racing a 50ms interval under parallel test load.
+    for (const expected of [2, 4, 5]) {
+      await synchronizer.start();
+      await waitFor(() => attemptedBundleIds.length >= expected);
+      await synchronizer.stop();
+      assert.equal(attemptedBundleIds.length, expected);
+    }
     assert.equal(new Set(attemptedBundleIds).size, 5);
   } finally {
     await synchronizer.stop();
@@ -918,6 +974,74 @@ function directorySyncError(code) {
   return error;
 }
 
+test("#1867 source sweep and upload share one durable bundle adoption", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "ccr-raw-trace-adoption-race-"));
+  const spoolDirectory = path.join(dir, "spool");
+  const source = path.join(spoolDirectory, "source");
+  mkdirSync(source, { recursive: true });
+  const bodyFile = path.join(source, "upstream_request.json");
+  writeFileSync(bodyFile, '{"model":"same-bundle"}');
+  const manifest = { parts: [{ filePath: bodyFile, partType: "upstream_request" }], requestId: "shared-adoption", turnKey: "shared-request" };
+  writeFileSync(path.join(source, "manifest.json"), JSON.stringify(manifest));
+  let releaseSync;
+  const syncGate = new Promise(resolve => { releaseSync = resolve; });
+  let syncing = false;
+  const synchronizer = new RawTraceSynchronizer({
+    enqueueUpdate: async () => false,
+    getConfig: createConfig,
+    replayIntervalMs: 10000,
+    spoolDirectory,
+    syncPartFile: async () => { syncing = true; await syncGate; }
+  });
+  try {
+    await synchronizer.start();
+    await waitFor(() => syncing);
+    const upload = sendRawTrace(synchronizer, manifest);
+    // Let the upload reach the source already moved into staging by the sweep.
+    await new Promise(resolve => setTimeout(resolve, 20));
+    releaseSync();
+    const result = await upload;
+    assert.equal(result.statusCode, 202, JSON.stringify(result.body));
+    assert.equal(result.body.durable, true);
+    assert.equal(readdirSync(path.join(spoolDirectory, ".ccr-inbox")).length, 1);
+    assert.equal(readdirSync(path.join(spoolDirectory, ".ccr-staging")).length, 0);
+  } finally {
+    releaseSync?.();
+    await synchronizer.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#1867 broken source bundles expire even below inbox capacity", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "ccr-raw-trace-broken-source-"));
+  const spoolDirectory = path.join(dir, "spool");
+  const source = path.join(spoolDirectory, "broken");
+  mkdirSync(source, { recursive: true });
+  writeFileSync(path.join(source, "manifest.json"), JSON.stringify({
+    parts: [{ filePath: path.join(source, "missing.json"), partType: "upstream_request" }],
+    requestId: "broken-source", turnKey: "broken-request"
+  }));
+  const synchronizer = new RawTraceSynchronizer({
+    bundleMaxAgeMs: 20,
+    enqueueUpdate: async () => false,
+    getConfig: createConfig,
+    inboxMaxBundles: 100,
+    replayIntervalMs: 5,
+    sourceBundleGraceMs: 60,
+    sourceScanIntervalMs: 1,
+    spoolDirectory
+  });
+  try {
+    await synchronizer.start();
+    await waitFor(() => !existsSync(source), 250);
+    await waitFor(() => readdirSync(path.join(spoolDirectory, ".ccr-dead-letter")).length === 1, 250);
+    assert.equal(readdirSync(path.join(spoolDirectory, ".ccr-inbox")).length, 0);
+  } finally {
+    await synchronizer.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 function createConfig() {
   const config = createDefaultAppConfig();
   config.observability.requestLogs = true;
@@ -951,3 +1075,38 @@ async function sendRawTrace(synchronizer, manifest, onResponse) {
   await synchronizer.handle(request, response);
   return result;
 }
+
+test("#1807 accepted but uncommitted bundles retain their retry budget after restart", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "ccr-raw-trace-restart-budget-"));
+  const spoolDirectory = path.join(dir, "spool");
+  const bundleDirectory = path.join(spoolDirectory, "poison-bundle");
+  mkdirSync(bundleDirectory, { recursive: true });
+  const bodyFile = path.join(bundleDirectory, "upstream_request.json");
+  writeFileSync(bodyFile, "{}");
+  writeFileSync(path.join(bundleDirectory, "manifest.json"), JSON.stringify({
+    parts: [{ filePath: bodyFile, partType: "upstream_request" }], requestId: "restart-budget", turnKey: "restart-request"
+  }));
+  let attempts = 0;
+  const options = { bundleMaxAttempts: 1, getConfig: createConfig, replayIntervalMs: 10000, retryCooldownMs: 10000, spoolDirectory,
+    enqueueUpdate: async () => { attempts += 1; return { accepted: true, degraded: false }; } };
+  const first = new RawTraceSynchronizer(options);
+  const second = new RawTraceSynchronizer(options);
+  try {
+    await first.start();
+    await waitFor(() => {
+      const inbox = path.join(spoolDirectory, ".ccr-inbox");
+      if (!existsSync(inbox)) return false;
+      return readdirSync(inbox).some(name => {
+        const file = path.join(inbox, name, ".ccr-delivery.json");
+        return existsSync(file) && JSON.parse(readFileSync(file, "utf8")).attempts === 1;
+      });
+    });
+    await first.stop();
+    await second.start();
+    await waitFor(() => {
+      const dead = path.join(spoolDirectory, ".ccr-dead-letter");
+      return existsSync(dead) && readdirSync(dead).length === 1;
+    });
+    assert.equal(attempts, 1);
+  } finally { await first.stop(); await second.stop(); rmSync(dir, { recursive: true, force: true }); }
+});

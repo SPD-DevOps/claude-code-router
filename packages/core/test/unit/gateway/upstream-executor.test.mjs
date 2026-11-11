@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { buildClaudeAppGatewayModelRoutes } from "@ccr/core/agents/claude-app/gateway-routes.ts";
+import { createDefaultAppConfig } from "@ccr/core/config/default-config.ts";
+import {
+  ccrRoutedModelHeader,
+  ccrRouterRouteResolverKey
+} from "@ccr/core/gateway/core-runtime/router-plugin-contract.ts";
+import { createGatewayPlugin } from "@ccr/core/gateway/core-runtime/router-plugin.ts";
 import { prepareClaudeAppDiscoveredModelRequest } from "@ccr/core/gateway/features/model-discovery.ts";
 import { fetchUpstreamWithFallback, prepareGatewayUpstreamAttemptForTest } from "@ccr/core/gateway/upstream/executor.ts";
 import { RequestRouteTraceRecorder } from "@ccr/core/observability/route-trace.ts";
@@ -66,6 +72,52 @@ test("retry backoff stops after client aborts a network error", async () => {
   await assertRetryBackoffStopsAfterAbort(async () => {
     throw new Error("upstream unavailable");
   });
+});
+
+test("fallback cancels unfinished error bodies without waiting for cancellation", async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    for (const cancellation of ["complete", "reject", "pending"]) {
+      let fetchCount = 0;
+      let cancelled = false;
+      const body = new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('{"error":"rate limited"}'));
+        },
+        cancel() {
+          cancelled = true;
+          if (cancellation === "reject") return Promise.reject(new Error("cleanup failed"));
+          if (cancellation === "pending") return new Promise(() => {});
+        }
+      });
+      globalThis.fetch = async () => {
+        fetchCount += 1;
+        return fetchCount === 1
+          ? new Response(body, { headers: { "retry-after": "0.001" }, status: 429 })
+          : new Response("{}", { status: 200 });
+      };
+
+      const result = await fetchUpstreamWithFallback({
+        body: Buffer.from('{"model":"test-model"}'),
+        config: retryConfig,
+        coreAuthToken: "core-token",
+        fallback: retryFallback,
+        headers: {},
+        method: "POST",
+        path: "/v1/messages",
+        routedModel: "test-model",
+        signal: AbortSignal.timeout(1000),
+        upstreamUrl: "http://127.0.0.1:3456/v1/messages"
+      });
+      assert.equal(cancelled, true, cancellation);
+      assert.equal(fetchCount, 2, cancellation);
+      assert.equal(result.response.status, 200, cancellation);
+      assert.equal(result.failedAttempts.length, 1, cancellation);
+      assert.equal(result.failedAttempts[0].statusCode, 429, cancellation);
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("OpenRouter discount provider constraints are removed from different fallback model attempts", async () => {
@@ -178,6 +230,57 @@ test("target-provider routing preserves slash-namespaced model ids", () => {
     assert.equal(attempt.body.model, item.model);
     assert.equal(attempt.logicalProvider, item.provider);
   }
+});
+
+test("OpenAI Responses upstream preserves response-native request bodies", () => {
+  const input = [
+    {
+      content: [{ text: "Developer rules", type: "input_text" }],
+      role: "developer",
+      type: "message"
+    },
+    {
+      content: [{ text: "inspect the repo", type: "input_text" }],
+      role: "user",
+      type: "message"
+    },
+    {
+      content: "System guardrails",
+      role: "system",
+      type: "message"
+    }
+  ];
+  const attempt = prepareGatewayUpstreamAttemptForTest({
+    body: {
+      input,
+      instructions: "You are Codex.",
+      model: "Provider/gpt-5.5",
+      reasoning_split: true,
+      stream: true
+    },
+    config: {
+      Providers: [
+        {
+          capabilities: [{ baseUrl: "https://openai-compatible.example/v1", type: "openai_responses" }],
+          credentials: [{ apiKey: "provider-key", id: "provider-main" }],
+          models: ["gpt-5.5"],
+          name: "Provider"
+        }
+      ],
+      Router: { fallback: { mode: "off", models: [], retryCount: 0 }, rules: [] },
+      virtualModelProfiles: []
+    },
+    headers: {},
+    method: "POST",
+    path: "/v1/responses",
+    routedModel: "Provider/gpt-5.5"
+  });
+
+  assert.equal(attempt.body.model, "gpt-5.5");
+  assert.equal(attempt.body.instructions, "You are Codex.");
+  assert.deepEqual(attempt.body.input, input);
+  assert.equal(attempt.body.reasoning_split, true);
+  assert.equal(attempt.credentialProtocol, "openai_responses");
 });
 
 test("Claude App OpenRouter routes do not send conflicting vendor-prefixed model selectors to the core gateway", () => {
@@ -470,6 +573,100 @@ test("model-chain fallback rebuilds every protocol attempt from the canonical re
         ?.changes.map((change) => change.path),
       ["/routing/fallback"]
     );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("model-chain fallback refreshes the routed model before core gateway resolution", async () => {
+  const config = createDefaultAppConfig();
+  config.Providers = [
+    {
+      api_base_url: "https://primary.example/v1/chat/completions",
+      id: "primary",
+      models: ["k3"],
+      name: "Primary",
+      type: "openai_chat_completions"
+    },
+    {
+      api_base_url: "https://fallback.example/v1/chat/completions",
+      id: "fallback",
+      models: ["glm-5.3"],
+      name: "智谱 AI（国内）",
+      type: "openai_chat_completions"
+    }
+  ];
+  const fallback = {
+    mode: "model-chain",
+    models: ["智谱 AI（国内）/glm-5.3"],
+    retryCount: 0
+  };
+  const plugin = await createGatewayPlugin({ plugin: { config: { appConfig: config } } });
+  const resolver = plugin.routeResolvers.find((item) => item.key === ccrRouterRouteResolverKey);
+  assert.ok(resolver);
+
+  const resolvedAttempts = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_url, init) => {
+    const body = JSON.parse(init.body);
+    const resolved = resolver.resolve({
+      model: body.model,
+      request: {
+        headers: init.headers,
+        method: "POST",
+        url: "/v1/chat/completions"
+      },
+      requestBody: body,
+      route: {
+        method: "POST",
+        url: "/v1/chat/completions"
+      }
+    });
+    resolvedAttempts.push({
+      headerModel: init.headers[ccrRoutedModelHeader],
+      model: resolved?.model,
+      provider: resolved?.targetProviderName
+    });
+    return new Response('{"ok":true}', {
+      headers: {
+        "content-type": "application/json",
+        "retry-after": "0.001"
+      },
+      status: resolvedAttempts.length === 1 ? 403 : 200
+    });
+  };
+
+  try {
+    const result = await fetchUpstreamWithFallback({
+      body: Buffer.from(JSON.stringify({
+        messages: [{ content: "hello", role: "user" }],
+        model: "k3"
+      })),
+      config,
+      coreAuthToken: "core-token",
+      fallback,
+      headers: {
+        [ccrRoutedModelHeader]: "Primary/k3"
+      },
+      method: "POST",
+      path: "/v1/chat/completions",
+      routedModel: "Primary/k3",
+      upstreamUrl: "http://127.0.0.1:3457/v1/chat/completions"
+    });
+
+    assert.equal(result.response.status, 200);
+    assert.deepEqual(resolvedAttempts, [
+      {
+        headerModel: "Primary/k3",
+        model: "k3",
+        provider: "primary"
+      },
+      {
+        headerModel: "fallback/glm-5.3",
+        model: "glm-5.3",
+        provider: "fallback"
+      }
+    ]);
   } finally {
     globalThis.fetch = originalFetch;
   }
