@@ -3,10 +3,12 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { simulateElectronVersion } from "../../support/desktop-runtime.mjs";
 import { claudeDesignRuntimePluginConfig, claudeShipRuntimePluginConfig, migrateKnownGatewayPluginConfigsForTest, withClaudeDesignRuntimePluginConfig } from "@ccr/core/config/config.ts";
 import { CCR_DESKTOP_APP_ENV } from "@ccr/core/runtime/desktop-app.ts";
 
 test("legacy combined Claude Design plugin config migrates to split Design and Ship plugins", () => {
+  const restoreElectron = simulateElectronVersion();
   const extensionsRoot = mkdtempSync(path.join(os.tmpdir(), "ccr-extensions-migration-"));
   const previousExtensionsDir = process.env.CCR_EXTENSIONS_DIR;
   const previousDesktopApp = process.env[CCR_DESKTOP_APP_ENV];
@@ -63,6 +65,7 @@ test("legacy combined Claude Design plugin config migrates to split Design and S
   } finally {
     restoreEnv("CCR_EXTENSIONS_DIR", previousExtensionsDir);
     restoreEnv(CCR_DESKTOP_APP_ENV, previousDesktopApp);
+    restoreElectron();
     rmSync(extensionsRoot, { force: true, recursive: true });
   }
 });
@@ -98,6 +101,7 @@ test("legacy Claude Design migration does not duplicate an existing Claude Ship 
 });
 
 test("Claude Design runtime plugin config resolves from the bundled plugin in CCR Desktop without persisting", () => {
+  const restoreElectron = simulateElectronVersion();
   const previousDesktopApp = process.env[CCR_DESKTOP_APP_ENV];
   try {
     process.env[CCR_DESKTOP_APP_ENV] = "1";
@@ -127,6 +131,7 @@ test("Claude Design runtime plugin config resolves from the bundled plugin in CC
     assert.equal(withClaudeDesignRuntimePluginConfig(configured), configured);
   } finally {
     restoreEnv(CCR_DESKTOP_APP_ENV, previousDesktopApp);
+    restoreElectron();
   }
 });
 

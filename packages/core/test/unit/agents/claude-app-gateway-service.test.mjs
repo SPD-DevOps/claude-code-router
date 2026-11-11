@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { applyClaudeAppGatewayConfig } from "@ccr/core/agents/claude-app/gateway-service.ts";
 import { resolveClaudeAppGatewayRouteModel } from "@ccr/core/agents/claude-app/gateway-routes.ts";
 
-test("Claude App gateway config keeps 3P mode signed out of Claude.ai", () => {
+test("Claude App gateway config uses static gateway credentials with current schema", () => {
   const dataDir = mkdtempSync(path.join(os.tmpdir(), "ccr-claude-app-gateway-config-"));
   const activeDataDir = `${dataDir}-3p`;
 
@@ -27,9 +27,9 @@ test("Claude App gateway config keeps 3P mode signed out of Claude.ai", () => {
     assert.equal(launchRootConfig.deploymentMode, "3p");
     assert.equal(activeRootConfig.deploymentMode, "3p");
     assert.deepEqual(launchGatewayConfig, activeGatewayConfig);
-    assert.deepEqual(activeGatewayConfig.authentication, {
-      disableClaudeAiSignIn: true
-    });
+    for (const key of ["authentication", "inferenceModelsUpdatedAt", "inferenceModelsVersion", "unstableDisableModelVerification"]) {
+      assert.equal(Object.hasOwn(activeGatewayConfig, key), false, key);
+    }
     assert.equal(activeGatewayConfig.bootstrapEnabled, false);
 
     assert.equal(activeGatewayConfig.inferenceProvider, "gateway");
@@ -38,7 +38,6 @@ test("Claude App gateway config keeps 3P mode signed out of Claude.ai", () => {
     assert.equal(activeGatewayConfig.inferenceGatewayApiKey, "existing-test-key");
     assert.equal(activeGatewayConfig.inferenceGatewayBaseUrl, "http://127.0.0.1:3456");
     assert.equal(activeGatewayConfig.modelDiscoveryEnabled, true);
-    assert.equal(activeGatewayConfig.unstableDisableModelVerification, true);
     assert.ok(activeGatewayConfig.inferenceModels.length > 0);
   } finally {
     rmSync(dataDir, { force: true, recursive: true });
@@ -75,6 +74,55 @@ test("Claude App gateway config writes the selected default model first", () => 
   }
 });
 
+test("Claude App gateway config preserves unknown keys when rewriting config library", () => {
+  const dataDir = mkdtempSync(path.join(os.tmpdir(), "ccr-claude-app-gateway-preserve-"));
+  const activeDataDir = `${dataDir}-3p`;
+  const configId = "8f69f2f1-3275-4ad8-9317-4aa7e972f311.json";
+  const applyOptions = { backup: false, dataDir };
+
+  try {
+    const { result } = applyClaudeAppGatewayConfig(createConfig(), applyOptions);
+    const launchLibraryFile = path.join(dataDir, "configLibrary", configId);
+    const activeLibraryFile = result.configLibraryFile;
+
+    for (const file of [launchLibraryFile, activeLibraryFile]) {
+      writeJson(file, {
+        ...readJson(file),
+        authentication: { disableClaudeAiSignIn: true },
+        inferenceModelsUpdatedAt: "2026-01-01",
+        inferenceModelsVersion: "old",
+        unstableDisableModelVerification: true,
+        coworkEgressAllowedHosts: ["*"],
+        extraUnknownKey: "keep-me"
+      });
+    }
+
+    applyClaudeAppGatewayConfig(createConfig({
+      PORT: 3457,
+      gateway: {
+        enabled: false,
+        host: "0.0.0.0",
+        port: 3457
+      }
+    }), applyOptions);
+
+    for (const file of [launchLibraryFile, activeLibraryFile]) {
+      const rewritten = readJson(file);
+      assert.deepEqual(rewritten.coworkEgressAllowedHosts, ["*"]);
+      assert.equal(rewritten.extraUnknownKey, "keep-me");
+      for (const key of ["authentication", "inferenceModelsUpdatedAt", "inferenceModelsVersion", "unstableDisableModelVerification"]) {
+        assert.equal(Object.hasOwn(rewritten, key), false, key);
+      }
+      assert.equal(rewritten.inferenceGatewayBaseUrl, "http://127.0.0.1:3457");
+      assert.equal(rewritten.inferenceProvider, "gateway");
+      assert.equal(rewritten.inferenceGatewayApiKey, "existing-test-key");
+    }
+  } finally {
+    rmSync(dataDir, { force: true, recursive: true });
+    rmSync(activeDataDir, { force: true, recursive: true });
+  }
+});
+
 function createConfig(overrides = {}) {
   return {
     APIKEY: "existing-test-key",
@@ -100,4 +148,8 @@ function createConfig(overrides = {}) {
 
 function readJson(file) {
   return JSON.parse(readFileSync(file, "utf8"));
+}
+
+function writeJson(file, value) {
+  writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`);
 }

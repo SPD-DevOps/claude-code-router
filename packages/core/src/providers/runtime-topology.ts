@@ -13,6 +13,13 @@ export function providerCapabilityForClientProtocol(
   clientProtocol: GatewayProviderProtocol
 ): (GatewayProviderCapability & { type: GatewayProviderProtocol }) | undefined {
   const capabilities = normalizedProviderCapabilities(provider);
+  if (clientProtocol === "anthropic_messages") {
+    const openRouterChat = capabilities.find((item) => item.type === "openai_chat_completions" &&
+      /^https:\/\/openrouter\.ai\/api\/v1(?:\/|$)/i.test(item.baseUrl || readBaseUrl(provider) || ""));
+    if (openRouterChat) {
+      return { ...openRouterChat, type: "openai_chat_completions" };
+    }
+  }
   for (const protocol of providerProtocolPreferenceForClient(clientProtocol)) {
     const capability = capabilities.find(
       (item): item is GatewayProviderCapability & { type: GatewayProviderProtocol } => item.type === protocol
@@ -242,9 +249,12 @@ function lockedProviderPresetProtocols(
     ...capabilities.map((capability) => capability.baseUrl)
   ].filter((value): value is string => Boolean(value?.trim()));
 
+  const hasGeminiOpenAiEndpoint = baseUrls.some((url) =>
+    /^https:\/\/generativelanguage\.googleapis\.com\/v1beta\/openai(?:\/|$)/i.test(url.trim())
+  );
   for (const baseUrl of baseUrls) {
     const presetId = findProviderPresetByBaseUrl(baseUrl)?.id;
-    if (presetId === "gemini") {
+    if (presetId === "gemini" && !hasGeminiOpenAiEndpoint) {
       return ["gemini_generate_content", "gemini_interactions"];
     }
     if (presetId === "nvidia") {
@@ -260,12 +270,12 @@ function lockedProviderPresetProtocols(
 
 function providerCapabilityPriority(capability: GatewayProviderCapability): number {
   if (capability.source === "preset") {
-    return 0;
-  }
-  if (capability.source === "detected") {
     return 2;
   }
-  return 1;
+  if (capability.source === "detected") {
+    return 1;
+  }
+  return 0;
 }
 
 export function providerCapabilityInternalName(provider: GatewayProviderConfig, protocol: GatewayProviderCapabilityProtocol): string {
@@ -429,6 +439,9 @@ export function normalizeProviderCapabilityProtocol(value: unknown): GatewayProv
 export function inferProtocol(provider: GatewayProviderConfig): GatewayProviderProtocol {
   const url = readBaseUrl(provider)?.toLowerCase() ?? "";
   const transformerNames = JSON.stringify(provider.transformer ?? "").toLowerCase();
+  if (/^https:\/\/generativelanguage\.googleapis\.com\/v1beta\/openai(?:\/|$)/.test(url)) {
+    return "openai_chat_completions";
+  }
   if (url.includes("/interactions") || transformerNames.includes("gemini_interactions")) {
     return "gemini_interactions";
   }

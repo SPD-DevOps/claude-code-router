@@ -1,4 +1,4 @@
-ARG NODE_IMAGE=node:22-bookworm
+ARG NODE_IMAGE=node:22-bookworm-slim
 ARG RUNTIME_NODE_IMAGE=node:22-bookworm-slim
 
 FROM ${NODE_IMAGE} AS build
@@ -12,15 +12,20 @@ COPY packages/ui/package.json packages/ui/package.json
 RUN npm ci
 
 COPY . .
+RUN if ls docker/local-ai-gateway/*.tgz >/dev/null 2>&1; then \
+    npm install --no-save docker/local-ai-gateway/*.tgz; \
+  fi
 RUN npm run build:docker
 
 FROM ${NODE_IMAGE} AS cli
-RUN npm install -g --prefix /opt/ccr-cli @musistudio/claude-code-router \
+ARG CCR_CLI_VERSION=3.1.3
+RUN npm install -g --prefix /opt/ccr-cli @musistudio/claude-code-router@${CCR_CLI_VERSION} \
   && npm cache clean --force
 
 FROM ${NODE_IMAGE} AS s3sdk
 WORKDIR /opt/ccr-s3-sdk
-RUN npm install @aws-sdk/client-s3 \
+ARG CCR_S3_SDK_VERSION=3.1166.0
+RUN npm install @aws-sdk/client-s3@${CCR_S3_SDK_VERSION} \
   && npm cache clean --force
 
 FROM ${NODE_IMAGE} AS production-deps
@@ -40,7 +45,6 @@ ENV NODE_ENV=production \
     CCR_NGINX_PORT=8080 \
     CCR_GATEWAY_HOST=127.0.0.1 \
     CCR_GATEWAY_PORT=3456 \
-    CCR_GATEWAY_CORE_PORT=3457 \
     CCR_PUBLIC_HOST=127.0.0.1 \
     CCR_PUBLIC_PORT=3458 \
     NODE_PATH=/opt/ccr-s3-sdk/node_modules

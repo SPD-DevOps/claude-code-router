@@ -1,0 +1,56 @@
+name: Speedio candidate validation (no deployment)
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: ["review/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: speedio-candidate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - run: npm run typecheck
+      - run: node --test tests/system/speedio-runtime.test.mjs
+      - run: npm run test:architecture
+      - run: npm run test:cli
+      - run: npm run test:ui
+      - name: Core tests
+        run: npm run test:core
+
+  docker-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - name: Build candidate locally (never push to registry)
+        run: docker build --tag claude-code-router:candidate .
+      - name: Upstream Docker smoke (synthetic volume and tokens)
+        env:
+          CCR_DOCKER_TEST_IMAGE: claude-code-router:candidate
+          CCR_DOCKER_TEST_SKIP_BUILD: "1"
+        run: npm run test:docker
+      - name: Speedio Basic Auth, SSH and restart smoke
+        env:
+          CCR_DOCKER_TEST_IMAGE: claude-code-router:candidate
+        run: node tests/system/speedio-auth-smoke.mjs

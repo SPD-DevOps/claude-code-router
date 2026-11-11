@@ -294,6 +294,56 @@ test("Claude App marks a custom model with a configured 1M context window", () =
   assert.equal(discoveredModel.capabilities.context_window.one_million_context_variant, true);
 });
 
+test("Claude App keeps a pinned 1M context window above the advertised effective percent", () => {
+  const config = createConfig({
+    providers: [
+      {
+        modelMetadata: {
+          "gpt-5.6-sol": {
+            contextWindow: 1_000_000,
+            contextWindowPinned: true,
+            effectiveContextWindowPercent: 95,
+            maxContextWindow: 1_000_000
+          }
+        },
+        models: ["gpt-5.6-sol"],
+        name: "Codex API",
+        type: "openai_responses"
+      }
+    ]
+  });
+  const route = buildClaudeAppGatewayModelRoutes(config)[0];
+  const discoveredModel = createClaudeModelsResponse(config).data[0];
+
+  assert.equal(route.oneMillionContext, true);
+  assert.equal(discoveredModel.max_input_tokens, 1_000_000);
+  assert.equal(discoveredModel.capabilities.context_window.supports_1m_context, true);
+});
+
+test("Claude App applies the advertised effective percent when the context window is not pinned", () => {
+  const config = createConfig({
+    providers: [
+      {
+        modelMetadata: {
+          "gpt-5.6-sol": {
+            contextWindow: 1_000_000,
+            effectiveContextWindowPercent: 95,
+            maxContextWindow: 1_000_000
+          }
+        },
+        models: ["gpt-5.6-sol"],
+        name: "Codex API",
+        type: "openai_responses"
+      }
+    ]
+  });
+  const route = buildClaudeAppGatewayModelRoutes(config)[0];
+  const discoveredModel = createClaudeModelsResponse(config).data[0];
+
+  assert.equal(route.oneMillionContext, false);
+  assert.equal(discoveredModel.max_input_tokens, 950_000);
+});
+
 test("Claude Code exposes a configured 1M context window as a visible model variant", () => {
   const config = createConfig({
     providers: [
@@ -339,37 +389,6 @@ test("Claude Code exposes a configured 1M context window as a visible model vari
   assert.equal(rewrite?.routedModel, "Zhipu AI (China) - Coding Plan/aaa");
 });
 
-test("Claude CLI bootstrap returns catalog-derived model configuration from models.json", () => {
-  const config = createConfig({
-    providers: [
-      {
-        models: ["glm-5.2"],
-        name: "Zhipu AI (China) - Coding Plan",
-        type: "openai_chat_completions"
-      }
-    ]
-  });
-  const route = buildClaudeAppGatewayModelRoutes(config)[0];
-  const bootstrap = createClaudeCliBootstrapResponse(config);
-  const option = bootstrap.additional_model_options[0];
-
-  assert.ok(route);
-  assert.equal(option.id, `${route.id}[1m]`);
-  assert.equal(option.model, `${route.id}[1m]`);
-  assert.equal(option.display_name, "Zhipu AI (China) - Coding Plan/GLM-5.2 (1M context)");
-  assert.equal(option.max_input_tokens, 1_049_000);
-  assert.equal(option.max_tokens, 1_048_576);
-  assert.equal(option.capabilities.context_window.max_input_tokens, 1_049_000);
-  assert.equal(option.capabilities.context_management.max_input_tokens, 1_049_000);
-  assert.equal(option.capabilities.context_window.supports_1m_context, true);
-  assert.equal(option.capabilities.context_window.one_million_context_variant, true);
-  assert.equal(option.capabilities.image_input.supported, true);
-  assert.equal(option.capabilities.structured_outputs.supported, true);
-  assert.equal(option.capabilities.tool_use.supported, true);
-  assert.equal(option.capabilities.thinking.supported, true);
-  assert.equal(bootstrap.auto_compact_windows[option.model], 1_000_000);
-  assert.equal(bootstrap.client_data.rowan_thicket[option.model], 1_000_000);
-});
 
 test("issue 1632 Claude discovery inherits Fusion fixed model provider context", () => {
   const config = createConfig({

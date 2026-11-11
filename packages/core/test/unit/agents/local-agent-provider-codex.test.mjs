@@ -1,8 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import {
   attachCodexRateLimitResetCreditDetails,
   codexDefaultBaseUrl,
+  codexDefaultClientVersion,
+  codexModelCatalogUrl,
+  probeCodexProvider,
   codexModelCatalogFromPayloadForTest,
   codexProviderAccountConfig,
   codexRateLimitResetCreditDetails,
@@ -80,7 +86,7 @@ test("Codex local provider account config upgrades persisted usage mapping", () 
   assert.ok(upgradedManualResetMeter.remaining.includes("$.rate_limit_reset_credits.available_count"));
 });
 
-test("Codex local provider config caps imported GPT-5 context metadata", () => {
+test("Codex local provider config preserves imported GPT-5 context metadata", () => {
   const provider = normalizeCodexProviderAccountConfig({
     api_base_url: codexDefaultBaseUrl,
     api_key: localAgentProviderApiKey,
@@ -89,23 +95,28 @@ test("Codex local provider config caps imported GPT-5 context metadata", () => {
         contextWindow: 64000,
         maxContextWindow: 64000
       },
+      "gpt-5-codex": {
+        contextWindow: 640000,
+        maxContextWindow: 720000
+      },
       "gpt-5.6-sol": {
         contextWindow: 1050000,
         maxContextWindow: 1050000
       }
     },
-    models: ["gpt-5-codex", "gpt-5.6-sol", "custom-model"],
+    models: ["gpt-5-codex", "gpt-5.5", "gpt-5.6-sol", "custom-model"],
     name: "Codex API",
     protocol: "openai_responses"
   });
 
   assert.deepEqual(provider.modelMetadata["gpt-5-codex"], {
-    contextWindow: 256000,
-    maxContextWindow: 256000
+    contextWindow: 640000,
+    maxContextWindow: 720000
   });
+  assert.equal(provider.modelMetadata["gpt-5.5"], undefined);
   assert.deepEqual(provider.modelMetadata["gpt-5.6-sol"], {
-    contextWindow: 368000,
-    maxContextWindow: 368000
+    contextWindow: 1050000,
+    maxContextWindow: 1050000
   });
   assert.deepEqual(provider.modelMetadata["custom-model"], {
     contextWindow: 64000,
@@ -129,6 +140,29 @@ test("Codex local provider config caps imported GPT-5 context metadata", () => {
   assert.deepEqual(nonLocal.modelMetadata["gpt-5.6-sol"], {
     contextWindow: 1050000,
     maxContextWindow: 1050000
+  });
+});
+
+test("Codex local provider config preserves pinned context metadata", () => {
+  const provider = normalizeCodexProviderAccountConfig({
+    api_base_url: codexDefaultBaseUrl,
+    api_key: localAgentProviderApiKey,
+    modelMetadata: {
+      "gpt-5-codex": {
+        contextWindow: 1000000,
+        contextWindowPinned: true,
+        maxContextWindow: 1000000
+      }
+    },
+    models: ["gpt-5-codex"],
+    name: "Codex API",
+    protocol: "openai_responses"
+  });
+
+  assert.deepEqual(provider.modelMetadata["gpt-5-codex"], {
+    contextWindow: 1000000,
+    contextWindowPinned: true,
+    maxContextWindow: 1000000
   });
 });
 
@@ -293,10 +327,10 @@ test("Codex model catalog parser accepts live model endpoint shapes", () => {
   });
   assert.deepEqual(catalog.modelMetadata["gpt-5-codex"], {
     additionalSpeedTiers: [{ id: "fast", label: "Fast" }],
-    contextWindow: 256000,
+    contextWindow: 272000,
     defaultReasoningLevel: "high",
     effectiveContextWindowPercent: 95,
-    maxContextWindow: 256000,
+    maxContextWindow: 300000,
     serviceTiers: [{ id: "auto" }],
     supportsFastMode: true,
     supportedReasoningLevels: [
@@ -305,17 +339,11 @@ test("Codex model catalog parser accepts live model endpoint shapes", () => {
     ],
     supportsReasoningSummaries: true
   });
-  assert.deepEqual(catalog.modelMetadata["gpt-5.1-codex"], {
-    contextWindow: 256000,
-    maxContextWindow: 256000
-  });
-  assert.deepEqual(catalog.modelMetadata["gpt-5.2-codex"], {
-    contextWindow: 256000,
-    maxContextWindow: 256000
-  });
+  assert.equal(catalog.modelMetadata["gpt-5.1-codex"], undefined);
+  assert.equal(catalog.modelMetadata["gpt-5.2-codex"], undefined);
 });
 
-test("Codex model catalog parser overrides imported GPT-5 context windows", () => {
+test("Codex model catalog parser does not synthesize context metadata", () => {
   const catalog = codexModelCatalogFromPayloadForTest({
     models: [
       "gpt-5-codex",
@@ -327,27 +355,7 @@ test("Codex model catalog parser overrides imported GPT-5 context windows", () =
     ]
   });
 
-  assert.deepEqual(catalog.modelMetadata["gpt-5-codex"], {
-    contextWindow: 256000,
-    maxContextWindow: 256000
-  });
-  assert.deepEqual(catalog.modelMetadata["gpt-5.5"], {
-    contextWindow: 256000,
-    maxContextWindow: 256000
-  });
-  assert.deepEqual(catalog.modelMetadata["gpt-5.6"], {
-    contextWindow: 368000,
-    maxContextWindow: 368000
-  });
-  assert.deepEqual(catalog.modelMetadata["gpt-5.6-sol"], {
-    contextWindow: 368000,
-    maxContextWindow: 368000
-  });
-  assert.deepEqual(catalog.modelMetadata["gpt-5.6-terra-2026-07-28"], {
-    contextWindow: 368000,
-    maxContextWindow: 368000
-  });
-  assert.equal(catalog.modelMetadata?.["gpt-50"], undefined);
+  assert.equal(catalog.modelMetadata, undefined);
 });
 
 test("Codex model catalog parser ignores invalid context metadata", () => {
@@ -364,3 +372,89 @@ test("Codex model catalog parser ignores invalid context metadata", () => {
 
   assert.equal(catalog.modelMetadata?.["invalid-context-model"], undefined);
 });
+
+
+test("Codex discovery sends the tested default client_version", () => {
+  const url = new URL(codexModelCatalogUrl(""));
+  assert.equal(url.origin + url.pathname, `${codexDefaultBaseUrl}/models`);
+  assert.equal(url.searchParams.get("client_version"), codexDefaultClientVersion);
+  assert.equal(codexDefaultClientVersion, "0.167.0");
+});
+
+test("Codex discovery permits an explicit client version without changing the endpoint", () => {
+  assert.equal(new URL(codexModelCatalogUrl(" 0.168.1 ")).searchParams.get("client_version"), "0.168.1");
+  assert.equal(new URL(codexModelCatalogUrl("0.168.1-beta.1")).searchParams.get("client_version"), "0.168.1-beta.1");
+  for (const value of ["latest", "0.168", "0.168.1&redirect=evil", "https://example.com"]) {
+    assert.throws(() => codexModelCatalogUrl(value), /semantic version/);
+  }
+});
+
+test("Codex discovery reads CCR_CODEX_CLIENT_VERSION at request time", () => {
+  const previous = process.env.CCR_CODEX_CLIENT_VERSION;
+  try {
+    process.env.CCR_CODEX_CLIENT_VERSION = "0.168.2";
+    assert.equal(new URL(codexModelCatalogUrl()).searchParams.get("client_version"), "0.168.2");
+    delete process.env.CCR_CODEX_CLIENT_VERSION;
+    assert.equal(new URL(codexModelCatalogUrl()).searchParams.get("client_version"), codexDefaultClientVersion);
+  } finally {
+    if (previous === undefined) delete process.env.CCR_CODEX_CLIENT_VERSION;
+    else process.env.CCR_CODEX_CLIENT_VERSION = previous;
+  }
+});
+
+
+async function withMockedCodexCatalog(response, run) {
+  const home = mkdtempSync(path.join(os.tmpdir(), "ccr-codex-discovery-"));
+  const previousHome = process.env.CCR_INTERNAL_HOME_DIR;
+  const previousVersion = process.env.CCR_CODEX_CLIENT_VERSION;
+  const originalFetch = globalThis.fetch;
+  try {
+    mkdirSync(path.join(home, ".codex"));
+    writeFileSync(path.join(home, ".codex", "auth.json"), JSON.stringify({
+      tokens: { access_token: "synthetic-test-token", account_id: "test-account" }
+    }), { mode: 0o600 });
+    process.env.CCR_INTERNAL_HOME_DIR = home;
+    process.env.CCR_CODEX_CLIENT_VERSION = "0.167.0";
+    globalThis.fetch = async (input, init) => {
+      assert.equal(new URL(String(input)).searchParams.get("client_version"), "0.167.0");
+      assert.equal(init.headers.authorization, "Bearer synthetic-test-token");
+      return response();
+    };
+    await run();
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (previousHome === undefined) delete process.env.CCR_INTERNAL_HOME_DIR;
+    else process.env.CCR_INTERNAL_HOME_DIR = previousHome;
+    if (previousVersion === undefined) delete process.env.CCR_CODEX_CLIENT_VERSION;
+    else process.env.CCR_CODEX_CLIENT_VERSION = previousVersion;
+    rmSync(home, { recursive: true, force: true });
+  }
+}
+
+const discoveryCandidate = {
+  id: "codex-api", kind: "codex", name: "Codex API", status: "available", importable: true,
+  protocol: "openai_responses", models: ["existing-model"]
+};
+
+test("Codex probe discovers the version-gated subscription catalog", async () => {
+  await withMockedCodexCatalog(() => Response.json({ models: [
+    { slug: "new-model-a", display_name: "New A" }, { slug: "new-model-b" }
+  ] }), async () => {
+    const result = await probeCodexProvider(discoveryCandidate);
+    assert.deepEqual(result.candidate.models, ["new-model-a", "new-model-b"]);
+    assert.deepEqual(discoveryCandidate.models, ["existing-model"]);
+  });
+});
+
+for (const [label, response] of [
+  ["HTTP error", () => Response.json({ error: { message: "unavailable" } }, { status: 429 })],
+  ["empty catalog", () => Response.json({ models: [] })],
+  ["transport failure", () => { throw new Error("synthetic network failure"); }]
+]) {
+  test(`Codex probe preserves existing models on ${label}`, async () => {
+    await withMockedCodexCatalog(response, async () => {
+      const result = await probeCodexProvider(discoveryCandidate);
+      assert.deepEqual(result.candidate.models, ["existing-model"]);
+    });
+  });
+}

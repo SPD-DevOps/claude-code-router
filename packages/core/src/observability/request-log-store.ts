@@ -1,3 +1,4 @@
+import { requestLogOutcome } from "@ccr/core/contracts/app";
 import { randomUUID } from "node:crypto";
 import { closeSync, copyFileSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -20,6 +21,7 @@ import { maxRequestLogBodyBytes, rawTraceHardMaxBodyBytes } from "@ccr/core/obse
 import { compactBase64ImagePayloads } from "@ccr/core/observability/request-log-body";
 import { requestLogRequestedModel, requestLogResponseModel } from "@ccr/core/observability/request-log-model";
 import { isSensitiveRequestLogHeaderName } from "@ccr/core/observability/sensitive-headers";
+import { inferGatewayClient } from "@ccr/core/gateway/http/io";
 import type {
   AgentAnalysisAgentRow,
   AgentAnalysisConversationItem,
@@ -63,6 +65,8 @@ import type {
   RequestRouteTrace,
   RequestRouteTraceHop,
   RequestRouteTraceSnapshot,
+  RequestStreamMetrics,
+  StreamSpeedSampleStatus,
   UsageStatsRange
 } from "@ccr/core/contracts/app";
 
@@ -101,6 +105,8 @@ type RequestLogStoredOutcome = {
   hasRequestBody: boolean;
   hasResponseBody: boolean;
   ok: boolean;
+  responseBodyContentType: string;
+  responseBodyText: string;
   statusCode: number;
 };
 
@@ -133,6 +139,7 @@ export type RequestLogRecordInput = {
   requestId?: string;
   resolvedModel?: string;
   routeTrace?: RequestRouteTrace;
+  streamMetrics?: RequestStreamMetrics;
   responseBodyText?: string;
   responseBodySizeBytes?: number;
   responseBodyTruncated?: boolean;
@@ -144,12 +151,17 @@ export type RequestLogRecordInput = {
 };
 
 export type RequestLogRawTraceUpdateInput = {
+  pricing?: ProviderModelPricing;
+  allowStandaloneRecord?: boolean;
   attempt?: number;
   bodyCapturePolicy?: "all" | "errors" | "none";
   bundleCapturedAt?: string;
   bundleId?: string;
+  client?: string;
+  completedAt?: string;
   deferBodyCaptureUntilRecord?: boolean;
   deferOutcomeUntilRecord?: boolean;
+  durationMs?: number;
   method?: string;
   model?: string;
   path?: string;
@@ -168,6 +180,7 @@ export type RequestLogRawTraceUpdateInput = {
   responseBodyText?: string;
   responseBodyTruncated?: boolean;
   responseHeaders?: HeaderRecord;
+  startedAt?: string;
   statusCode?: number;
   url?: string;
 };
@@ -209,6 +222,7 @@ export type RequestLogStoreWriteResult = {
 };
 
 type StoredRequestLogEntry = {
+  activeOutputMs?: number;
   cacheReadTokens: number;
   cacheWriteTokens: number;
   client: string;
@@ -223,13 +237,17 @@ type StoredRequestLogEntry = {
   id: number;
   inputTokens: number;
   isStream: boolean;
+  maxInterEventGapMs?: number;
   method: string;
   model: string;
   ok: boolean;
   outputTokens: number;
+  outputTokensPerSecond?: number;
   path: string;
+  p95InterEventGapMs?: number;
   provider: string;
   reasoningTokens: number;
+  responseHeadersMs?: number;
   requestedModel: string;
   requestBody: RequestLogBody;
   requestHeaders: Record<string, string | string[]>;
@@ -244,7 +262,12 @@ type StoredRequestLogEntry = {
   responseModel: string;
   responseHeaders: Record<string, string | string[]>;
   statusCode: number;
+  streamSpeedSampleStatus?: StreamSpeedSampleStatus;
+  tailMs?: number;
+  timeToFirstSignalMs?: number;
+  timeToFirstTextMs?: number;
   totalTokens: number;
+  upstreamTimeToFirstSignalMs?: number;
   url: string;
 };
 
@@ -460,6 +483,13 @@ export class RequestLogStore {
         if (bundleId && hasProcessedRawTraceBundle(database, bundleId)) {
           continue;
         }
+        if (command.input.allowStandaloneRecord && !hasRequestLogWithRequestId(database, command.input.requestId.trim())) {
+          await this.record(standaloneRecordInputFromRawTrace(command.input, command.rawTraceFiles));
+          if (bundleId) {
+            rememberProcessedRawTraceBundle(database, bundleId, command.input.requestId.trim());
+          }
+          continue;
+        }
         const rawTraceInput = this.prepareRawTraceInput(command.input, command.rawTraceFiles);
         const applied = await this.updateFromRawTrace(rawTraceInput);
         if (bundleId && applied) {
@@ -647,6 +677,7 @@ export class RequestLogStore {
       responseHeaders,
       url: input.url
     });
+    const streamMetrics = resolveStoredStreamMetrics(input.streamMetrics, outputTokens, reasoningTokens);
 
     const statement = this.insertRequestStatement ??= database.prepare(`
       INSERT OR IGNORE INTO request_logs (
@@ -696,8 +727,9 @@ export class RequestLogStore {
         response_body_size_bytes,
         response_body_truncated,
         response_body_ref,
+        stream_metrics_json,
         error
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     let inserted = false;
@@ -749,6 +781,7 @@ export class RequestLogStore {
         responseBody.sizeBytes,
         responseBody.truncated ? 1 : 0,
         responseBody.bodyRef ?? "",
+        streamMetrics ? JSON.stringify(streamMetrics) : "",
         responseError ?? ""
       );
       if (result.changes === 0) return;
@@ -892,9 +925,13 @@ export class RequestLogStore {
     if (mergedRequestHeaders) {
       pushValue("request_headers", JSON.stringify(mergedRequestHeaders));
     }
-    if (responseHeaders) {
-      pushValue("response_headers", JSON.stringify(responseHeaders));
-    }
+    // The gateway already wrote the authoritative merged response headers
+    // (including x-ccr-fallback-attempts, which powers the R{n} retry badge)
+    // when it inserted this row. Raw-trace only refines rows that already exist
+    // (guarded above), so writing response_headers here would clobber those
+    // gateway headers — and an empty upstream header set would wipe them to "{}".
+    // Keep the incoming set for usage/billing extraction below, but do not
+    // persist it to the response_headers column.
     if (input.responseBodyText !== undefined || responseHeaders) {
       const bodyUsage = input.responseBodyText === undefined
         ? undefined
@@ -993,8 +1030,17 @@ export class RequestLogStore {
       );
       pushBodyValues(sets, params, "request", requestBody);
     }
-    const shouldApplyResponseBody = input.responseBodyText !== undefined ||
-      Boolean(input.responseBodyRef && (!input.responseBodyTruncated || !existingOutcome.hasResponseBody));
+    const preserveExistingResponseBody = shouldPreserveExistingResponseBodyForRawTrace(
+      existingOutcome,
+      input,
+      responseHeaders,
+      responseBodyContentType,
+      sseError
+    );
+    const shouldApplyResponseBody = !preserveExistingResponseBody && (
+      input.responseBodyText !== undefined ||
+      Boolean(input.responseBodyRef && (!input.responseBodyTruncated || !existingOutcome.hasResponseBody))
+    );
     if (shouldApplyResponseBody && (
       captureResolution.bodiesSuppressed || Boolean(input.responseBodyRef) || (input.responseBodyText?.length ?? 0) > 0 || !existingOutcome.hasResponseBody
     )) {
@@ -1007,6 +1053,8 @@ export class RequestLogStore {
         { bodyDir: this.bodyDir, bodyRef: input.responseBodyRef, side: "response" }
       );
       pushBodyValues(sets, params, "response", responseBody);
+    } else if (preserveExistingResponseBody && input.responseBodyRef) {
+      deleteRequestLogBodyRefs(this.bodyDir, [input.responseBodyRef]);
     }
 
     const update = () => {
@@ -1060,6 +1108,7 @@ export class RequestLogStore {
             status_code,
             ok,
             duration_ms,
+            stream_metrics_json,
             input_tokens,
             output_tokens,
             reasoning_tokens,
@@ -1408,6 +1457,7 @@ export class RequestLogStore {
         response_body_size_bytes INTEGER NOT NULL DEFAULT 0,
         response_body_truncated INTEGER NOT NULL DEFAULT 0,
         response_body_ref TEXT NOT NULL DEFAULT '',
+        stream_metrics_json TEXT NOT NULL DEFAULT '',
         error TEXT NOT NULL DEFAULT ''
       );
 
@@ -1590,6 +1640,160 @@ export class RequestLogStore {
     }
     return next;
   }
+}
+
+function standaloneRecordInputFromRawTrace(
+  input: RequestLogRawTraceUpdateInput,
+  rawTraceFiles?: RequestLogRawTraceFiles
+): RequestLogRecordInput {
+  const now = new Date().toISOString();
+  const bodyCapturePolicy = input.bodyCapturePolicy === "errors" || input.bodyCapturePolicy === "none"
+    ? input.bodyCapturePolicy
+    : "all";
+  const maxBodyBytes = resolveStandaloneRawTraceBodyLimit(rawTraceFiles?.maxBodyBytes);
+  const requestHeaders = headersToRecord(input.requestHeaders);
+  const responseHeaders = headersToRecord(input.responseHeaders) as Record<string, string | string[]>;
+  const responseContentType = input.responseBodyContentType ?? headerValue(responseHeaders, "content-type");
+  const responseBodyForOutcome = rawTraceBodyText(input.responseBodyText, rawTraceFiles?.responseBody, maxRequestLogBodyBytes);
+  const statusCode = normalizeCount(input.statusCode);
+  const rawFailure = (statusCode > 0 && (statusCode < 200 || statusCode >= 400)) ||
+    Boolean(detectSseError(responseBodyForOutcome, responseContentType));
+  const captureBody = bodyCapturePolicy === "all" || (bodyCapturePolicy === "errors" && rawFailure);
+  const requestBody = captureBody
+    ? rawTraceBodyBuffer(input.requestBodyText, rawTraceFiles?.requestBody, maxBodyBytes)
+    : suppressedRawTraceBody(input.requestBodySizeBytes, input.requestBodyTruncated);
+  const responseBody = captureBody
+    ? rawTraceBodyTextCapture(input.responseBodyText, rawTraceFiles?.responseBody, maxBodyBytes)
+    : suppressedRawTraceBody(input.responseBodySizeBytes, input.responseBodyTruncated);
+  const completedAt = normalizeFilterValue(input.completedAt) ??
+    normalizeFilterValue(input.bundleCapturedAt) ??
+    now;
+  const durationMs = normalizeCount(input.durationMs);
+  const startedAt = normalizeFilterValue(input.startedAt) ??
+    startedAtFromCompletedAt(completedAt, durationMs);
+  const client = normalizeFilterValue(input.client) ?? inferGatewayClient(undefined, requestHeaders);
+
+  return {
+    bodyCapturePolicy,
+    captureBody,
+    ...(client ? { client } : {}),
+    completedAt,
+    durationMs,
+    ...(input.bundleId ? { eventId: `raw-trace:${input.bundleId}` } : {}),
+    fallbackModel: input.model,
+    maxBodyBytes,
+    method: input.method ?? "POST",
+    model: input.model,
+    path: input.path ?? pathFromUrl(input.url) ?? "/",
+    providerName: input.provider,
+    pricing: input.pricing,
+    requestBody: requestBody.buffer,
+    requestBodySizeBytes: requestBody.sizeBytes,
+    requestBodyTruncated: requestBody.truncated,
+    requestHeaders,
+    requestId: input.requestId,
+    responseBodySizeBytes: responseBody.sizeBytes,
+    responseBodyText: responseBody.text,
+    responseBodyTruncated: responseBody.truncated,
+    responseHeaders,
+    startedAt,
+    statusCode,
+    url: input.url ?? input.path ?? "/"
+  };
+}
+
+function startedAtFromCompletedAt(completedAt: string, durationMs: number): string {
+  const completedAtMs = Date.parse(completedAt);
+  if (!Number.isFinite(completedAtMs)) {
+    return completedAt;
+  }
+  return new Date(Math.max(0, completedAtMs - Math.max(0, durationMs))).toISOString();
+}
+
+function resolveStandaloneRawTraceBodyLimit(value: number | undefined): number {
+  if (value === undefined) {
+    return maxRequestLogBodyBytes;
+  }
+  const normalized = normalizeCount(value);
+  return normalized > 0 ? Math.min(normalized, maxRequestLogBodyBytes) : 0;
+}
+
+function rawTraceBodyBuffer(
+  text: string | undefined,
+  file: RequestLogRawTraceFile | undefined,
+  maxBytes: number
+): { buffer: Buffer; sizeBytes?: number; truncated?: boolean } {
+  if (maxBytes <= 0) {
+    return suppressedRawTraceBody(file?.sizeBytes, file?.truncated);
+  }
+  if (text !== undefined) {
+    const buffer = Buffer.from(text);
+    const data = buffer.byteLength > maxBytes ? buffer.subarray(0, maxBytes) : buffer;
+    return {
+      buffer: data,
+      sizeBytes: Math.max(buffer.byteLength, normalizeCount(file?.sizeBytes)),
+      truncated: Boolean(file?.truncated) || data.byteLength < buffer.byteLength
+    };
+  }
+  if (!file) {
+    return { buffer: Buffer.alloc(0), sizeBytes: 0, truncated: false };
+  }
+  try {
+    const buffer = readFileSync(file.filePath);
+    return {
+      buffer: buffer.byteLength > maxBytes ? buffer.subarray(0, maxBytes) : buffer,
+      sizeBytes: Math.max(buffer.byteLength, normalizeCount(file.sizeBytes)),
+      truncated: Boolean(file.truncated) || buffer.byteLength > maxBytes
+    };
+  } catch {
+    return suppressedRawTraceBody(file.sizeBytes, true);
+  }
+}
+
+function rawTraceBodyTextCapture(
+  text: string | undefined,
+  file: RequestLogRawTraceFile | undefined,
+  maxBytes: number
+): { text: string; sizeBytes?: number; truncated?: boolean } {
+  const buffer = rawTraceBodyBuffer(text, file, maxBytes);
+  return {
+    sizeBytes: buffer.sizeBytes,
+    text: new StringDecoder("utf8").write(buffer.buffer),
+    truncated: buffer.truncated
+  };
+}
+
+function rawTraceBodyText(
+  text: string | undefined,
+  file: RequestLogRawTraceFile | undefined,
+  maxBytes: number
+): string {
+  if (text !== undefined) {
+    const buffer = Buffer.from(text);
+    return new StringDecoder("utf8").write(buffer.byteLength > maxBytes ? buffer.subarray(0, maxBytes) : buffer);
+  }
+  if (!file || maxBytes <= 0 || !isTextLikeContentType(file.contentType)) {
+    return "";
+  }
+  try {
+    const buffer = readFileSync(file.filePath);
+    return new StringDecoder("utf8").write(buffer.byteLength > maxBytes ? buffer.subarray(0, maxBytes) : buffer);
+  } catch {
+    return "";
+  }
+}
+
+function suppressedRawTraceBody(
+  sizeBytes: number | undefined,
+  truncated: boolean | undefined
+): { buffer: Buffer; sizeBytes?: number; text: string; truncated?: boolean } {
+  const size = normalizeCount(sizeBytes);
+  return {
+    buffer: Buffer.alloc(0),
+    sizeBytes: size,
+    text: "",
+    truncated: Boolean(truncated) || size > 0
+  };
 }
 
 export const requestLogStore = new RequestLogStore(REQUEST_LOGS_DB_FILE);
@@ -3300,7 +3504,7 @@ function buildAgentRouteRows(requests: AnalyzedAgentRequest[]): AgentObservabili
 
 function buildAgentErrorRows(requests: AnalyzedAgentRequest[]): AgentObservabilityErrorRow[] {
   return requests
-    .filter((request) => !request.ok || Boolean(request.error))
+    .filter((request) => requestLogOutcome(request) === "error")
     .slice(-100)
     .reverse()
     .map((request) => ({
@@ -3816,7 +4020,8 @@ function buildAgentAnalysisTotals(requests: AnalyzedAgentRequest[]): AgentAnalys
   const costUsd = sum(requests, (request) => request.costUsd ?? 0);
   const totalTokens = sum(requests, agentAnalysisTotalTokenCount);
   const promptTokens = sum(requests, agentAnalysisPromptTokenCount);
-  const successfulRequests = requests.filter((request) => request.ok).length;
+  const successfulRequests = requests.filter((request) => requestLogOutcome(request) === "completed").length;
+  const errorCount = requests.filter((request) => requestLogOutcome(request) === "error").length;
   const sessionCount = new Set(requests.map((request) => `${request.agent}:${request.sessionId}`)).size;
   const durations = requests.map((request) => request.durationMs).sort((a, b) => a - b);
 
@@ -3827,7 +4032,7 @@ function buildAgentAnalysisTotals(requests: AnalyzedAgentRequest[]): AgentAnalys
     cacheTokens,
     cacheWriteTokens,
     costUsd,
-    errorCount: requests.length - successfulRequests,
+    errorCount,
     inputTokens,
     maxConcurrentRequests: maxConcurrentRequests(requests),
     maxDurationMs: durations.at(-1) ?? 0,
@@ -3838,7 +4043,7 @@ function buildAgentAnalysisTotals(requests: AnalyzedAgentRequest[]): AgentAnalys
     requestCount: requests.length,
     sessionCount,
     subagentCallCount: requests.filter((request) => Boolean(request.subagentModel)).length,
-    successRate: successfulRequests / requests.length,
+    successRate: ratio(successfulRequests, successfulRequests + errorCount),
     toolCallCount: sum(requests, (request) => request.toolCallCount),
     totalTokens
   };
@@ -4286,6 +4491,7 @@ function ensureRequestLogSchema(database: SqlDatabase): void {
   addColumn("response_body_size_bytes", "INTEGER NOT NULL DEFAULT 0");
   addColumn("response_body_truncated", "INTEGER NOT NULL DEFAULT 0");
   addColumn("response_body_ref", "TEXT NOT NULL DEFAULT ''");
+  addColumn("stream_metrics_json", "TEXT NOT NULL DEFAULT ''");
   addColumn("error", "TEXT NOT NULL DEFAULT ''");
 
   if (needsModelSummaryMigration) {
@@ -4603,7 +4809,7 @@ function buildLogWhereClause(filter: RequestLogListFilter): { params: SqlValue[]
   if (status === "success") {
     where.push("ok = 1");
   } else if (status === "error") {
-    where.push("ok = 0");
+    where.push("ok = 0 AND (status_code > 0 OR error <> '')");
   }
   if (model) {
     where.push("model = ?");
@@ -4863,6 +5069,7 @@ function readRequestLogById(database: SqlDatabase, id: number): StoredRequestLog
         status_code,
         ok,
         duration_ms,
+        stream_metrics_json,
         input_tokens,
         output_tokens,
         reasoning_tokens,
@@ -4896,6 +5103,12 @@ function readRequestLogById(database: SqlDatabase, id: number): StoredRequestLog
 
 function toRequestLogEntry(row: Record<string, SqlValue>): StoredRequestLogEntry {
   const costUsd = asFloat(row.cost_usd);
+  const outputTokens = normalizeCount(row.output_tokens);
+  const streamMetrics = parseStoredStreamMetrics(row.stream_metrics_json);
+  const outputTokensPerSecond = streamMetrics?.sampleStatus === "complete" &&
+    streamMetrics.activeOutputMs !== undefined && streamMetrics.activeOutputMs > 0 && outputTokens >= 2
+    ? Math.round(((outputTokens - 1) * 1_000 / streamMetrics.activeOutputMs) * 10) / 10
+    : undefined;
   const requestBody = bodyFromRow(row, "request") ?? emptyBody();
   const responseBody = bodyFromRow(row, "response");
   const requestHeaders = parseHeaderJson(row.request_headers);
@@ -4909,6 +5122,7 @@ function toRequestLogEntry(row: Record<string, SqlValue>): StoredRequestLogEntry
     url: String(row.url ?? "")
   });
   return {
+    ...(streamMetrics?.activeOutputMs !== undefined ? { activeOutputMs: streamMetrics.activeOutputMs } : {}),
     cacheReadTokens: normalizeCount(row.cache_read_tokens),
     cacheWriteTokens: normalizeCount(row.cache_write_tokens),
     client: normalizeLabel(String(row.client ?? ""), "unknown"),
@@ -4923,13 +5137,17 @@ function toRequestLogEntry(row: Record<string, SqlValue>): StoredRequestLogEntry
     id: normalizeCount(row.id),
     inputTokens: normalizeCount(row.input_tokens),
     isStream,
+    ...(streamMetrics?.maxInterEventGapMs !== undefined ? { maxInterEventGapMs: streamMetrics.maxInterEventGapMs } : {}),
     method: String(row.method ?? ""),
     model: normalizeLabel(String(row.model ?? ""), "unknown"),
     ok: normalizeCount(row.ok) === 1,
-    outputTokens: normalizeCount(row.output_tokens),
+    outputTokens,
+    ...(outputTokensPerSecond !== undefined ? { outputTokensPerSecond } : {}),
     path: normalizeLabel(String(row.path ?? ""), "/"),
+    ...(streamMetrics?.p95InterEventGapMs !== undefined ? { p95InterEventGapMs: streamMetrics.p95InterEventGapMs } : {}),
     provider: normalizeLabel(String(row.provider ?? ""), "unknown"),
     reasoningTokens: normalizeCount(row.reasoning_tokens),
+    ...(streamMetrics?.responseHeadersMs !== undefined ? { responseHeadersMs: streamMetrics.responseHeadersMs } : {}),
     requestedModel: normalizeLabel(String(row.requested_model ?? ""), ""),
     requestBody,
     requestHeaders,
@@ -4943,9 +5161,78 @@ function toRequestLogEntry(row: Record<string, SqlValue>): StoredRequestLogEntry
     responseHeaders,
     responseModel: normalizeLabel(String(row.response_model ?? ""), ""),
     statusCode: normalizeCount(row.status_code),
+    ...(streamMetrics ? { streamSpeedSampleStatus: streamMetrics.sampleStatus } : {}),
+    ...(streamMetrics?.tailMs !== undefined ? { tailMs: streamMetrics.tailMs } : {}),
+    ...(streamMetrics?.timeToFirstSignalMs !== undefined ? { timeToFirstSignalMs: streamMetrics.timeToFirstSignalMs } : {}),
+    ...(streamMetrics?.timeToFirstTextMs !== undefined ? { timeToFirstTextMs: streamMetrics.timeToFirstTextMs } : {}),
     totalTokens: normalizeCount(row.total_tokens),
+    ...(streamMetrics?.upstreamTimeToFirstSignalMs !== undefined
+      ? { upstreamTimeToFirstSignalMs: streamMetrics.upstreamTimeToFirstSignalMs }
+      : {}),
     url: String(row.url ?? "")
   };
+}
+
+function resolveStoredStreamMetrics(
+  metrics: RequestStreamMetrics | undefined,
+  outputTokens: number,
+  reasoningTokens: number
+): RequestStreamMetrics | undefined {
+  if (!metrics) {
+    return undefined;
+  }
+  let sampleStatus = metrics.sampleStatus;
+  if (sampleStatus === "complete") {
+    if (outputTokens === 0) {
+      sampleStatus = "usage_missing";
+    } else if (outputTokens < 2) {
+      sampleStatus = "insufficient_tokens";
+    } else if (reasoningTokens > 0 && !metrics.reasoningObserved) {
+      sampleStatus = "hidden_reasoning";
+    } else if (metrics.activeOutputMs === undefined || metrics.activeOutputMs <= 0) {
+      sampleStatus = "batched_output";
+    }
+  }
+  return { ...metrics, sampleStatus };
+}
+
+function parseStoredStreamMetrics(value: SqlValue): RequestStreamMetrics | undefined {
+  if (typeof value !== "string" || !value.trim()) {
+    return undefined;
+  }
+  const parsed = parseJson(value);
+  if (!isRecord(parsed) || !isStreamSpeedSampleStatus(parsed.sampleStatus)) {
+    return undefined;
+  }
+  return {
+    ...optionalStreamMetricNumber("activeOutputMs", parsed.activeOutputMs),
+    estimatedOutputTokens: normalizeCount(parsed.estimatedOutputTokens),
+    ...optionalStreamMetricNumber("maxInterEventGapMs", parsed.maxInterEventGapMs),
+    ...optionalStreamMetricNumber("p95InterEventGapMs", parsed.p95InterEventGapMs),
+    reasoningObserved: parsed.reasoningObserved === true,
+    ...optionalStreamMetricNumber("responseHeadersMs", parsed.responseHeadersMs),
+    sampleStatus: parsed.sampleStatus,
+    ...optionalStreamMetricNumber("tailMs", parsed.tailMs),
+    textObserved: parsed.textObserved === true,
+    ...optionalStreamMetricNumber("timeToFirstSignalMs", parsed.timeToFirstSignalMs),
+    ...optionalStreamMetricNumber("timeToFirstTextMs", parsed.timeToFirstTextMs),
+    toolObserved: parsed.toolObserved === true,
+    ...optionalStreamMetricNumber("upstreamTimeToFirstSignalMs", parsed.upstreamTimeToFirstSignalMs)
+  };
+}
+
+function optionalStreamMetricNumber<Key extends keyof RequestStreamMetrics>(
+  key: Key,
+  value: unknown
+): Partial<Pick<RequestStreamMetrics, Key>> {
+  const number = asNumber(value);
+  return number === undefined ? {} : { [key]: number } as Partial<Pick<RequestStreamMetrics, Key>>;
+}
+
+function isStreamSpeedSampleStatus(value: unknown): value is StreamSpeedSampleStatus {
+  return value === "complete" || value === "partial" || value === "usage_missing" ||
+    value === "insufficient_tokens" || value === "unsupported_protocol" ||
+    value === "hidden_reasoning" || value === "batched_output";
 }
 
 function bodyFromRow(row: Record<string, SqlValue>, prefix: "request" | "response"): RequestLogBody | undefined {
@@ -5409,6 +5696,8 @@ function readRequestLogStoredOutcome(database: SqlDatabase, requestId: string): 
         length(request_body_text) AS request_body_chars,
         length(response_body_text) AS response_body_chars,
         request_body_ref,
+        response_body_content_type,
+        response_body_text,
         response_body_ref,
         ok,
         status_code
@@ -5427,6 +5716,8 @@ function readRequestLogStoredOutcome(database: SqlDatabase, requestId: string): 
     hasRequestBody: normalizeCount(row?.request_body_chars) > 0 || Boolean(normalizeFilterValue(String(row?.request_body_ref ?? ""))),
     hasResponseBody: normalizeCount(row?.response_body_chars) > 0 || Boolean(normalizeFilterValue(String(row?.response_body_ref ?? ""))),
     ok: normalizeCount(row?.ok) === 1,
+    responseBodyContentType: String(row?.response_body_content_type ?? ""),
+    responseBodyText: String(row?.response_body_text ?? ""),
     statusCode: normalizeCount(row?.status_code)
   };
 }
@@ -5441,6 +5732,32 @@ function applyRawTraceBodyCapturePolicy(
     bodiesSuppressed,
     input: bodiesSuppressed ? suppressRequestLogRawTraceBodies(input) : input
   };
+}
+
+function shouldPreserveExistingResponseBodyForRawTrace(
+  existingOutcome: RequestLogStoredOutcome,
+  input: RequestLogRawTraceUpdateInput,
+  responseHeaders: Record<string, string | string[]> | undefined,
+  responseBodyContentType: string | undefined,
+  sseError: string | undefined
+): boolean {
+  if (!existingOutcome.hasResponseBody) {
+    return false;
+  }
+  if (sseError) {
+    return false;
+  }
+  if (!hasMeaningfulExistingResponseBodyText(existingOutcome.responseBodyText)) {
+    return false;
+  }
+  return input.isStream === true ||
+    contentTypeLooksStreaming(responseBodyContentType) ||
+    contentTypeLooksStreaming(headerValue(responseHeaders ?? {}, "content-type"));
+}
+
+function hasMeaningfulExistingResponseBodyText(value: string): boolean {
+  const trimmed = value.trim();
+  return Boolean(trimmed && trimmed !== "{}" && trimmed !== "[]" && trimmed !== "null");
 }
 
 function serializePendingRawTraceUpdate(
@@ -6080,6 +6397,7 @@ function extractUsageSnapshot(payload: unknown): UsageSnapshot | undefined {
     inputDetails?.cached_tokens !== undefined ||
     inputDetails?.cache_creation_tokens !== undefined ||
     usage.cached_tokens !== undefined ||
+    usage.prompt_cache_hit_tokens !== undefined ||
     usage.prompt_tokens !== undefined;
   const cacheCreation = isRecord(usage.cache_creation) ? usage.cache_creation : undefined;
   const cacheWrite5mTokens = asNumber(cacheCreation?.ephemeral_5m_input_tokens);
@@ -6090,7 +6408,8 @@ function extractUsageSnapshot(payload: unknown): UsageSnapshot | undefined {
       asNumber(usage.cache_read_tokens) ??
       asNumber(usage.cache_read_input_tokens) ??
       asNumber(usage.cached_tokens) ??
-      asNumber(inputDetails?.cached_tokens),
+      asNumber(inputDetails?.cached_tokens) ??
+      asNumber(usage.prompt_cache_hit_tokens),
     cacheWrite1hTokens,
     cacheWrite5mTokens,
     cacheWriteTokens:

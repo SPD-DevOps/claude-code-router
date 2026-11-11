@@ -8,7 +8,7 @@ import { minimaxChinaProviderPreset } from "@ccr/core/providers/presets/minimax/
 import { moonshotGlobalProviderPreset } from "@ccr/core/providers/presets/moonshot/index.ts";
 import { qiniuAiProviderPreset } from "@ccr/core/providers/presets/qiniu-ai/index.ts";
 import { xiaomiMimoProviderPreset } from "@ccr/core/providers/presets/xiaomi/index.ts";
-import { AddProviderDialog, AddProviderForm, ProviderConnectivityCheckDialog, ProvidersView, uniqueProviderProbeProtocolRows } from "@ccr/ui/pages/home/components/providers.tsx";
+import { AddProviderDialog, AddProviderForm, ProviderConnectivityCheckDialog, ProvidersView, localAgentProviderAlreadyImported, localAgentProviderPluginSuffixesForCandidate, uniqueProviderProbeProtocolRows } from "@ccr/ui/pages/home/components/providers.tsx";
 import {
   applyProviderProbeResult,
   createProviderConfigFromDeepLink,
@@ -29,11 +29,14 @@ import {
   providerAccountConnectorsTextWithNewApiUserBalanceTemplate,
   providerAutoFetchKnownModelsForSave,
   parseProviderAccountDraft,
+  parseProviderExtraJsonDraft,
   providerBrowserConnectorFromDraft,
   providerGlobalBaseUrlForProbe,
+  providerManualFieldsForSave,
   providerPresetIconUrls,
   providerProtocolOptions,
   providerProbeCandidates,
+  providerProbeModelsForProtocol,
   providerSelectableProtocolsFromProbe,
   removeLocalAgentProviderPluginsForProvider,
   setProviderPresets
@@ -142,6 +145,115 @@ test("provider save keeps explicit secondary media origins when the base URL is 
   assert.deepEqual(
     providerCapabilitiesForSave(current, media, "https://chat.example/v1/", "https://chat.example/v1"),
     [...current, ...media]
+  );
+});
+
+test("#1765 saving and reopening a manual provider does not resurrect unchecked protocols", () => {
+  const baseUrl = "https://llmgw.company.test/Minimax";
+  const selected = [{ baseUrl, source: "preset" as const, type: "openai_chat_completions" as const }];
+  const previous = [
+    ...selected,
+    { baseUrl, source: "detected" as const, type: "anthropic_messages" as const }
+  ];
+  for (const mode of ["manual", "auto"] as const) {
+    const capabilities = providerCapabilitiesForSave(selected, previous, baseUrl, baseUrl);
+    assert.deepEqual(capabilities, selected);
+    const draft = createProviderDraftFromProvider({
+      api_base_url: baseUrl, capabilities, models: ["DeepSeek-V4-Flash"], name: "company",
+      protocolDetectionMode: mode, type: "openai_chat_completions"
+    });
+    assert.deepEqual(draft.selectedProtocols, ["openai_chat_completions"]);
+    assert.equal(draft.protocolDetectionMode, mode);
+  }
+});
+
+test("provider save keeps hand-written fields the dialog cannot edit", () => {
+  const existing = {
+    api_base_url: "https://example.test/v1",
+    api_key: "sk-old",
+    billing: { currency: "USD" },
+    extraBody: { default: { reasoning_effort: "high" } },
+    extraHeaders: { "x-tenant": "acme" },
+    models: ["model-a"],
+    name: "example",
+    provider: "openai",
+    transformer: { use: ["openrouter"] },
+    type: "openai_chat_completions"
+  };
+
+  // extraBody and extraHeaders are absent on purpose: the Advanced settings
+  // section edits them, so they round-trip through the draft instead.
+  assert.deepEqual(providerManualFieldsForSave(existing), {
+    billing: existing.billing,
+    provider: existing.provider,
+    transformer: existing.transformer
+  });
+});
+
+test("provider draft round-trips the advanced JSON boxes", () => {
+  const provider = {
+    api_base_url: "https://example.test/v1",
+    // Raw ai-gateway shape: "default" plus top-level model-name keys (the
+    // normalized byModel form is internal to ai-gateway and never saved).
+    extraBody: { default: { reasoning_effort: "low" }, "model-a": { reasoning_effort: "high" } },
+    extraHeaders: { "x-tenant": "acme" },
+    models: ["model-a"],
+    name: "example"
+  };
+
+  const draft = createProviderDraftFromProvider(provider);
+
+  assert.deepEqual(parseProviderExtraJsonDraft(draft.extraBodyText, "extraBody"), provider.extraBody);
+  assert.deepEqual(parseProviderExtraJsonDraft(draft.extraHeadersText, "extraHeaders"), provider.extraHeaders);
+});
+
+test("provider draft leaves the advanced JSON boxes empty when unset", () => {
+  const draft = createProviderDraftFromProvider({ models: ["model-a"], name: "example" });
+
+  assert.equal(draft.extraBodyText, "");
+  assert.equal(draft.extraHeadersText, "");
+  assert.equal(parseProviderExtraJsonDraft(draft.extraBodyText, "extraBody"), undefined);
+  assert.equal(parseProviderExtraJsonDraft(draft.extraHeadersText, "extraHeaders"), undefined);
+});
+
+test("advanced JSON boxes reject malformed input instead of saving it", () => {
+  assert.equal(
+    parseProviderExtraJsonDraft("{ not json", "extraBody"),
+    "Extra request body JSON is invalid."
+  );
+  assert.equal(
+    parseProviderExtraJsonDraft("[1, 2]", "extraBody"),
+    "Extra request body must be a JSON object."
+  );
+  assert.equal(
+    parseProviderExtraJsonDraft("\"x-tenant\"", "extraHeaders"),
+    "Extra request headers must be a JSON object."
+  );
+  assert.equal(parseProviderExtraJsonDraft("   \n  ", "extraBody"), undefined);
+});
+
+test("provider save drops legacy credential aliases so the edited values win", () => {
+  const existing = {
+    apiKey: "sk-legacy",
+    apikey: "sk-legacy",
+    baseUrl: "https://legacy.test/v1",
+    baseurl: "https://legacy.test/v1",
+    models: ["model-a"],
+    name: "example"
+  };
+
+  const preserved = providerManualFieldsForSave(existing) as Record<string, unknown>;
+
+  for (const alias of ["apiKey", "apikey", "baseUrl", "baseurl"]) {
+    assert.equal(alias in preserved, false, `${alias} must not survive a dialog save`);
+  }
+});
+
+test("provider save does not invent keys the provider never had", () => {
+  assert.deepEqual(providerManualFieldsForSave(undefined), {});
+  assert.deepEqual(
+    providerManualFieldsForSave({ models: ["model-a"], name: "example" }),
+    {}
   );
 });
 
@@ -424,7 +536,7 @@ test("AddProviderDialog progressively reveals provider setup steps", () => {
   assert.match(html, /sm:w-\[min\(1040px,calc\(100vw-3rem\)\)\]/);
   assert.doesNotMatch(html, /max-w-\[760px\]/);
   assert.doesNotMatch(html, /max-w-\[1040px\]/);
-  assert.match(html, />1 \/ 4</);
+  assert.doesNotMatch(html, />1 \/ 4</);
   assert.match(html, />Next</);
   assert.doesNotMatch(html, />Cancel<\/button>/);
   assert.doesNotMatch(html, /Add credentials/);
@@ -1473,6 +1585,60 @@ test("New API user balance template adds configurable user self connector", () =
   assert.equal(connectors[1].headers.Authorization, "Bearer <new-api-access-token>");
   assert.equal(connectors[1].headers["New-Api-User"], "42");
   assert.equal(connectors[1].mapping.meters[0].id, "new_api_user_balance");
+});
+
+test("Zen and Go candidates use distinct local agent plugin suffixes", () => {
+  const zenCandidate = {
+    id: "opencode-api-anthropic-messages",
+    importable: true,
+    kind: "opencode",
+    models: ["shared-model"],
+    name: "OpenCode Zen (Anthropic)",
+    protocol: "anthropic_messages",
+    status: "available"
+  };
+  const goCandidate = {
+    ...zenCandidate,
+    id: "opencode-go-api-anthropic-messages",
+    name: "OpenCode Go (Anthropic)"
+  };
+
+  assert.deepEqual(localAgentProviderPluginSuffixesForCandidate(zenCandidate), [
+    "-opencode-anthropic-messages-api-key",
+    "-opencode-anthropic-messages-api-key-internal"
+  ]);
+  assert.deepEqual(localAgentProviderPluginSuffixesForCandidate(goCandidate), [
+    "-opencode-go-anthropic-messages-api-key",
+    "-opencode-go-anthropic-messages-api-key-internal"
+  ]);
+
+  const zenProvider = {
+    api_key: "ccr-local-agent-login",
+    models: ["shared-model"],
+    name: "OpenCode Zen (Anthropic)"
+  };
+  const zenPlugin = {
+    key: "ccr-local-agent-opencode-zen-anthropic-opencode-anthropic-messages-api-key",
+    providerName: "OpenCode Zen (Anthropic)"
+  };
+  assert.equal(localAgentProviderAlreadyImported(zenCandidate, [zenProvider], [zenPlugin]), true);
+  assert.equal(localAgentProviderAlreadyImported(goCandidate, [zenProvider], [zenPlugin]), false);
+});
+
+test("provider probe models prefer the protocol-scoped list", () => {
+  const probe = {
+    models: ["chat-model", "responses-model"],
+    normalizedBaseUrl: "https://opencode.ai/zen/go",
+    protocolModels: {
+      openai_chat_completions: ["chat-model"],
+      openai_responses: ["responses-model"]
+    },
+    protocols: []
+  };
+  assert.deepEqual(providerProbeModelsForProtocol(probe, "openai_responses"), ["responses-model"]);
+  assert.deepEqual(providerProbeModelsForProtocol(probe, "anthropic_messages"), ["chat-model", "responses-model"]);
+  assert.deepEqual(providerProbeModelsForProtocol({ ...probe, protocolModels: undefined }, "openai_responses"), ["chat-model", "responses-model"]);
+  assert.deepEqual(providerProbeModelsForProtocol(undefined, "openai_responses"), []);
 });
 
 function providerInstallLinkPayload(link) {
