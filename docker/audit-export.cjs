@@ -72,6 +72,11 @@ async function exportAudit(dbFile, s3, PutObjectCommand, options) {
       group.lines.push(JSON.stringify(result.record));group.counts.exported++;
     }
   } finally {db.close();}
+  // Publish explicit empty days too; absence of an object is an export failure, not zero use.
+  for(let t=Date.now()-8*86400000;t<=Date.now();t+=86400000){
+    const date=day(t);
+    if(date>=day(options.since) && !groups.has(date)) groups.set(date,{lines:[],counts:{total:0,exported:0}});
+  }
   for (const [date,group] of groups) {
     // Merge with prior exports: SQLite retention/restarts must not erase unreviewed history.
     const {GetObjectCommand}=require("@aws-sdk/client-s3");
