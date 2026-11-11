@@ -705,3 +705,154 @@ test('429 quarantines an account across all models and never reuses an entirely 
   quarantine(second);
   for (const model of provider.models) assert.throws(() => prepare(model), /All credentials.*quarantined/);
 });
+
+test("model-chain skips a fully quarantined provider and answers via the next model", async () => {
+  const { recordProviderCredentialOutcome } = await import("@ccr/core/providers/credential-pool.ts");
+  const { providerCredentialInternalName } = await import("@ccr/core/providers/runtime-topology.ts");
+  const suffix = Date.now();
+  const claudeProtocol = "anthropic_messages";
+  const claudeFirst = { apiKey: "claude-first", id: "dpublio-gmail", priority: 0 };
+  const claudeSecond = { apiKey: "claude-second", id: "existing-subscription", priority: 1 };
+  const claudeProvider = {
+    capabilities: [{ baseUrl: "https://api.anthropic.com", type: claudeProtocol }],
+    credentials: [claudeFirst, claudeSecond],
+    id: `anthropic-primary-${suffix}`,
+    models: ["claude-sonnet-5", "claude-opus-5"],
+    name: `Anthropic Primary ${suffix}`
+  };
+  const gptProvider = {
+    capabilities: [{ baseUrl: "https://chatgpt.com/backend-api", type: "openai_responses" }],
+    credentials: [{ apiKey: "codex-key", id: "codex-main" }],
+    id: `openai-fallback-${suffix}`,
+    models: ["gpt-6.1-sol"],
+    name: `OpenAI Fallback ${suffix}`
+  };
+  const config = {
+    Providers: [claudeProvider, gptProvider],
+    Router: {
+      fallback: {
+        mode: "model-chain",
+        models: [`${claudeProvider.name}/claude-opus-5`, `${gptProvider.name}/gpt-6.1-sol`],
+        retryCount: 0
+      },
+      rules: []
+    },
+    profile: { enabled: false, profiles: [] },
+    virtualModelProfiles: []
+  };
+  for (const credential of claudeProvider.credentials) {
+    recordProviderCredentialOutcome(config, "POST", {
+      credentialChain: [providerCredentialInternalName(claudeProvider, claudeProtocol, credential)],
+      credentialProtocol: claudeProtocol,
+      logicalProvider: claudeProvider.name
+    }, 429, new Headers());
+  }
+
+  const captured = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_url, init) => {
+    captured.push({
+      body: JSON.parse(String(init.body)),
+      headers: init.headers
+    });
+    return new Response('{"ok":true}', {
+      headers: { "content-type": "application/json" },
+      status: 200
+    });
+  };
+
+  try {
+    const result = await fetchUpstreamWithFallback({
+      body: Buffer.from(JSON.stringify({
+        messages: [{ content: "hello", role: "user" }],
+        model: `${claudeProvider.name}/claude-sonnet-5`
+      })),
+      config,
+      coreAuthToken: "core-token",
+      fallback: config.Router.fallback,
+      headers: {},
+      method: "POST",
+      path: "/v1/messages",
+      routedModel: `${claudeProvider.name}/claude-sonnet-5`,
+      upstreamUrl: "http://127.0.0.1:3456/v1/messages"
+    });
+
+    assert.equal(result.response.status, 200);
+    assert.equal(captured.length, 1);
+    assert.equal(captured[0].body.model, "gpt-6.1-sol");
+    assert.equal(result.attempt.logicalProvider, gptProvider.name);
+    assert.equal(result.failedAttempts.length, 2);
+    assert.match(result.failedAttempts[0].error, /All credentials for .* are quarantined after HTTP 429/);
+    assert.match(result.failedAttempts[1].error, /All credentials for .* are quarantined after HTTP 429/);
+    assert.equal(result.failedAttempts[0].delayMs, 0);
+    assert.equal(result.failedAttempts[1].delayMs, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("model-chain still fails when every remaining hop is quarantined", async () => {
+  const { recordProviderCredentialOutcome } = await import("@ccr/core/providers/credential-pool.ts");
+  const { providerCredentialInternalName } = await import("@ccr/core/providers/runtime-topology.ts");
+  const suffix = Date.now();
+  const protocol = "anthropic_messages";
+  const first = { apiKey: "first", id: "primary", priority: 0 };
+  const second = { apiKey: "second", id: "secondary", priority: 1 };
+  const provider = {
+    capabilities: [{ baseUrl: "https://api.anthropic.com", type: protocol }],
+    credentials: [first, second],
+    id: `anthropic-only-${suffix}`,
+    models: ["claude-sonnet-5", "claude-opus-5"],
+    name: `Anthropic Only ${suffix}`
+  };
+  const config = {
+    Providers: [provider],
+    Router: {
+      fallback: {
+        mode: "model-chain",
+        models: [`${provider.name}/claude-opus-5`],
+        retryCount: 0
+      },
+      rules: []
+    },
+    profile: { enabled: false, profiles: [] },
+    virtualModelProfiles: []
+  };
+  for (const credential of provider.credentials) {
+    recordProviderCredentialOutcome(config, "POST", {
+      credentialChain: [providerCredentialInternalName(provider, protocol, credential)],
+      credentialProtocol: protocol,
+      logicalProvider: provider.name
+    }, 429, new Headers());
+  }
+
+  let fetchCount = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    fetchCount += 1;
+    return new Response("{}", { status: 200 });
+  };
+
+  try {
+    await assert.rejects(
+      () => fetchUpstreamWithFallback({
+        body: Buffer.from(JSON.stringify({
+          messages: [{ content: "hello", role: "user" }],
+          model: `${provider.name}/claude-sonnet-5`
+        })),
+        config,
+        coreAuthToken: "core-token",
+        fallback: config.Router.fallback,
+        headers: {},
+        method: "POST",
+        path: "/v1/messages",
+        routedModel: `${provider.name}/claude-sonnet-5`,
+        upstreamUrl: "http://127.0.0.1:3456/v1/messages"
+      }),
+      /All credentials for .* are quarantined after HTTP 429/
+    );
+    assert.equal(fetchCount, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

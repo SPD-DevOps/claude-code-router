@@ -20,7 +20,7 @@ import { ccrRoutedModelHeader } from "@ccr/core/gateway/core-runtime/router-plug
 import { activeProviderCredentials, findProviderByPublicOrInternalName, findProviderCredentialBySlug, normalizedProviderCapabilities, parseProviderCredentialInternalName, providerCapabilityForClientProtocol, providerCapabilityInternalName, providerCapabilityNameMatches, providerCredentialInternalName, providerCredentialPriority, providerCredentialRuntimeId, providerCredentialSlug, providerProtocolForClientProtocol, sanitizeHeaderValue } from "@ccr/core/providers/runtime-topology";
 import { delay } from "@ccr/core/gateway/internal/clock";
 import { retryDelayAfterNetworkError, retryDelayAfterStatus, shouldFallbackAfterStatus } from "@ccr/core/gateway/upstream/retry-policy";
-import { claudeCodeOauthBetaHeader, claudeCodeOauthRequiredBeta, UpstreamRequestError } from "@ccr/core/gateway/internal/shared";
+import { claudeCodeOauthBetaHeader, claudeCodeOauthRequiredBeta, ProviderCredentialsQuarantinedError, UpstreamRequestError } from "@ccr/core/gateway/internal/shared";
 import type { ApiKeyLimitUsage, ProviderCredentialRoutingTarget, UpstreamAttempt, UpstreamFailedAttempt, UpstreamFetchResult } from "@ccr/core/gateway/internal/shared";
 import type { RouteTraceObserver } from "@ccr/core/observability/route-trace";
 import { monotonicNowMs } from "@ccr/core/observability/stream-experience";
@@ -414,17 +414,61 @@ export async function fetchUpstreamWithFallback(input: {
       target: cachedAttemptRouting.routedModel ? { model: cachedAttemptRouting.routedModel } : undefined
     });
     const attemptPreparationStartedAt = Date.now();
-    const attempt = prepareUpstreamCredentialAttempt({
-      attempt: {
-        ...plannedAttempt,
-        body: cachedAttemptRouting.body,
-        model: cachedAttemptRouting.routedModel ?? plannedAttempt.model
-      },
-      config: input.config,
-      headers: attemptHeaders,
-      method: input.method,
-      path: input.path
-    });
+    const hasNextAttempt = index < attempts.length - 1;
+    let attempt: UpstreamAttempt;
+    try {
+      attempt = prepareUpstreamCredentialAttempt({
+        attempt: {
+          ...plannedAttempt,
+          body: cachedAttemptRouting.body,
+          model: cachedAttemptRouting.routedModel ?? plannedAttempt.model
+        },
+        config: input.config,
+        headers: attemptHeaders,
+        method: input.method,
+        path: input.path
+      });
+    } catch (error) {
+      const message = formatError(error);
+      const skippedModel = cachedAttemptRouting.routedModel ?? plannedAttempt.model;
+      const skippedProvider = plannedAttempt.target?.kind === "provider"
+        ? plannedAttempt.target.provider.name
+        : undefined;
+      const skipToNextModel = hasNextAttempt
+        && fallbackMode === "model-chain"
+        && error instanceof ProviderCredentialsQuarantinedError;
+      input.trace?.capture({
+        attempt: attemptNumber,
+        durationMs: Date.now() - attemptPreparationStartedAt,
+        kind: "outcome",
+        name: "upstream.attempt.outcome",
+        outcome: {
+          error: message,
+          ...(skipToNextModel ? { fallbackReason: "credential-quarantine", retryDelayMs: 0 } : {})
+        },
+        phase: "outcome",
+        startedAtMs: attemptPreparationStartedAt,
+        status: "error",
+        target: {
+          ...(skippedModel ? { model: skippedModel } : {}),
+          ...(skippedProvider ? { provider: skippedProvider } : {})
+        }
+      });
+      failedAttempts.push({
+        delayMs: 0,
+        error: message,
+        model: skippedModel
+      });
+      releaseJsonObject(attemptSourceBody);
+      releaseJsonObject(input.body);
+      if (skipToNextModel) {
+        continue;
+      }
+      throw new UpstreamRequestError(message, {
+        cause: error,
+        failedAttempts
+      });
+    }
     if (index > 0) {
       const headers = { ...attempt.headers };
       const attemptRoutedModel = routedModelHeaderForAttempt(attempt);
@@ -435,7 +479,6 @@ export async function fetchUpstreamWithFallback(input: {
       }
       attempt.headers = headers;
     }
-    const hasNextAttempt = index < attempts.length - 1;
     const attemptUrl = rewriteRouteModelInUrl(input.upstreamUrl, attempt.model);
     const upstreamHeaders = {
       ...withCoreGatewayAuthHeader(
@@ -1039,7 +1082,7 @@ function selectProviderCredentials(
   });
   const eligible = candidates.filter((candidate) => candidate.cooldown?.reason !== "HTTP 429");
   if (eligible.length === 0 && candidates.length > 0) {
-    throw new Error(`All credentials for ${provider.name} are quarantined after HTTP 429; retry after quarantine expires.`);
+    throw new ProviderCredentialsQuarantinedError(provider.name);
   }
   const available = eligible.filter((candidate) => !candidate.cooldown && !candidate.limitState.blocked);
   const sorted = sortProviderCredentialCandidates(available.length > 0 ? available : eligible);
