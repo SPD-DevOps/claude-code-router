@@ -657,7 +657,7 @@ test("model-chain fallback refreshes the routed model before core gateway resolu
     assert.equal(result.response.status, 200);
     assert.deepEqual(resolvedAttempts, [
       {
-        headerModel: "Primary/k3",
+        headerModel: "primary/k3",
         model: "k3",
         provider: "primary"
       },
@@ -667,6 +667,92 @@ test("model-chain fallback refreshes the routed model before core gateway resolu
         provider: "fallback"
       }
     ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("account failover preserves the selected credential on the next request's first attempt", async () => {
+  const { providerCredentialInternalName } = await import("@ccr/core/providers/runtime-topology.ts");
+  const protocol = "anthropic_messages";
+  const first = { apiKey: "first-key", id: "primary", priority: 0 };
+  const second = { apiKey: "second-key", id: "secondary", priority: 1 };
+  const provider = {
+    capabilities: [{ baseUrl: "https://api.anthropic.com", type: protocol }],
+    credentials: [first, second],
+    id: `first-attempt-account-${Date.now()}`,
+    models: ["claude-opus-5"],
+    name: `First attempt account ${Date.now()}`
+  };
+  const config = createDefaultAppConfig();
+  config.Providers = [provider];
+  config.Router = { fallback: retryFallback, rules: [] };
+  config.profile = { enabled: false, profiles: [] };
+  config.virtualModelProfiles = [];
+  const plugin = await createGatewayPlugin({ plugin: { config: { appConfig: config } } });
+  const resolver = plugin.routeResolvers.find((item) => item.key === ccrRouterRouteResolverKey);
+  assert.ok(resolver);
+
+  const primaryRuntime = providerCredentialInternalName(provider, protocol, first);
+  const secondaryRuntime = providerCredentialInternalName(provider, protocol, second);
+  const selector = `${provider.name}/claude-opus-5`;
+  const captured = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_url, init) => {
+    const body = JSON.parse(init.body);
+    const resolved = resolver.resolve({
+      model: body.model,
+      request: { headers: init.headers, method: "POST", url: "/v1/messages" },
+      requestBody: body,
+      route: { method: "POST", url: "/v1/messages" }
+    });
+    captured.push({
+      headerModel: init.headers[ccrRoutedModelHeader],
+      selected: init.headers["x-target-providers"].split(",")[0],
+      resolved: resolved?.targetProviderName
+    });
+    // As in production, failed bridge responses need not identify the account
+    // in a response header. The executor must preserve its selection itself.
+    return new Response("{}", {
+      headers: { "content-type": "application/json", "retry-after": "0.001" },
+      status: resolved?.targetProviderName === primaryRuntime ? 429 : 200
+    });
+  };
+
+  const request = () => fetchUpstreamWithFallback({
+    body: Buffer.from(JSON.stringify({
+      messages: [{ content: "synthetic account failover test", role: "user" }],
+      model: selector
+    })),
+    config,
+    coreAuthToken: "core-token",
+    fallback: retryFallback,
+    headers: { [ccrRoutedModelHeader]: selector },
+    method: "POST",
+    path: "/v1/messages",
+    routedModel: selector,
+    upstreamUrl: "http://127.0.0.1:3457/v1/messages"
+  });
+
+  try {
+    const firstRequest = await request();
+    assert.equal(firstRequest.response.status, 200);
+    assert.equal(firstRequest.failedAttempts.length, 1);
+    assert.deepEqual(firstRequest.attempt.credentialIds, [second.id]);
+
+    // A new request must skip the quarantined primary at BOTH routing layers,
+    // without retrying that account or quarantining the healthy secondary.
+    const nextRequest = await request();
+    assert.equal(nextRequest.response.status, 200);
+    assert.equal(nextRequest.failedAttempts.length, 0);
+    assert.deepEqual(nextRequest.attempt.credentialIds, [second.id]);
+    assert.deepEqual(captured.map((attempt) => attempt.resolved), [
+      primaryRuntime, secondaryRuntime, secondaryRuntime
+    ]);
+    for (const attempt of captured) {
+      assert.equal(attempt.resolved, attempt.selected);
+      assert.equal(attempt.headerModel, `${attempt.selected}/claude-opus-5`);
+    }
   } finally {
     globalThis.fetch = originalFetch;
   }
