@@ -469,7 +469,10 @@ export async function fetchUpstreamWithFallback(input: {
         failedAttempts
       });
     }
-    if (index > 0) {
+    // The core resolver prioritizes this selector over target-provider headers.
+    // Pin provider selections even on the first attempt so the core cannot
+    // reselect a quarantined account; retain first-attempt passthrough otherwise.
+    if (index > 0 || attempt.target?.kind === "provider") {
       const headers = { ...attempt.headers };
       const attemptRoutedModel = routedModelHeaderForAttempt(attempt);
       if (attemptRoutedModel) {

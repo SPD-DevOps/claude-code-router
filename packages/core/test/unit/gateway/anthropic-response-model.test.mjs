@@ -101,7 +101,10 @@ test("gateway pipeline strips client supplied CCR route headers", async () => {
 
   assert.equal(result.upstreamHeaders?.["x-ccr-route-fallback"], undefined);
   assert.equal(result.upstreamHeaders?.["x-ccr-route-stage"], undefined);
-  assert.equal(result.upstreamHeaders?.["x-ccr-routed-model"], "kimi-test/k3");
+  assert.match(
+    result.upstreamHeaders?.["x-ccr-routed-model"],
+    /^provider-kimi-test-[a-f0-9]+::anthropic_messages\/k3$/
+  );
 });
 
 async function runAnthropicPipelineModelRewrite(requestModel, requestHeaders = {}) {
