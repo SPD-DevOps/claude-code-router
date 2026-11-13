@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { CredentialQuarantineStore, credentialQuarantineMs } from '@ccr/core/providers/credential-quarantine.ts';
 
-test('429 quarantine persists across restart, is account-wide, expires after 2h and does not extend', () => {
+test('429 quarantine persists across restart, is account-wide, expires after 1h and does not extend', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ccr-quarantine-test-'));
   try {
     let now = 1000;
