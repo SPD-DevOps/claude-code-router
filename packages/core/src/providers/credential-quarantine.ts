@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
-export const credentialQuarantineMs = 2 * 60 * 60 * 1000;
+export const credentialQuarantineMs = 60 * 60 * 1000;
 
 /** Durable account-wide 429 quarantine. Contains runtime IDs, never credentials. */
 export class CredentialQuarantineStore {
