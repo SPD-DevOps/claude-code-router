@@ -4519,6 +4519,7 @@ function ensureRequestLogSchema(database: SqlDatabase): void {
 const requestLogMigrationBatchSize = 500;
 const gatewayOutcomeMigrationName = "gateway-outcome-v1";
 const gatewayFinalAttemptMigrationName = "gateway-final-attempt-v1";
+const streamFlagsMigrationName = "stream-flags-v1";
 
 function ensureRequestLogMigrationSchema(database: SqlDatabase): void {
   database.exec(`
@@ -4691,50 +4692,80 @@ function ensurePendingRawTraceUpdateSchema(database: SqlDatabase): void {
   prunePendingRawTraceUpdates(database, Date.now());
 }
 
+// One-time, paged backfill. It used to run on every writer start and load every
+// non-stream row whose (often truncated) body mentions "stream" in a single
+// `.all()`; truncated bodies never match, so the set only grew until the writer
+// worker hit its heap limit during open() and crash-looped (ERR_WORKER_OUT_OF_MEMORY).
 function backfillRequestLogStreamFlags(database: SqlDatabase): void {
-  const rows = queryRows(
-    database,
-      `
-        SELECT
-          rowid AS id,
-          path,
-          url,
-          request_headers,
-          response_headers,
-          request_body_text,
-          request_body_encoding,
-          response_body_content_type
-        FROM request_logs
-        WHERE source_usage_id IS NULL
-          AND is_stream = 0
-          AND (
-            path LIKE '%stream%' OR
-            url LIKE '%stream%' OR
-            request_body_text LIKE '%stream%' OR
-            response_headers LIKE '%event-stream%' OR
-            response_body_content_type LIKE '%event-stream%'
-          )
-      `
-  );
-  if (rows.length === 0) {
-    return;
-  }
-
-  const statement = database.prepare("UPDATE request_logs SET is_stream = 1 WHERE rowid = ?");
-  for (const row of rows) {
-    const requestBodyText = String(row.request_body_encoding ?? "utf8") === "utf8"
-      ? String(row.request_body_text ?? "")
-      : undefined;
-    const isStream = inferRequestLogIsStream({
-      path: String(row.path ?? ""),
-      requestBodyText,
-      requestHeaders: parseHeaderJson(row.request_headers),
-      responseBodyContentType: String(row.response_body_content_type ?? ""),
-      responseHeaders: parseHeaderJson(row.response_headers),
-      url: String(row.url ?? "")
-    });
-    if (isStream) {
-      statement.run(normalizeCount(row.id));
+  const state = requestLogMigrationState(database, streamFlagsMigrationName);
+  if (state.completed) return;
+  const selectIds = database.prepare(`
+    SELECT id
+    FROM request_logs
+    WHERE id > ?
+      AND source_usage_id IS NULL
+      AND is_stream = 0
+      AND (
+        path LIKE '%stream%' OR
+        url LIKE '%stream%' OR
+        request_body_text LIKE '%stream%' OR
+        response_headers LIKE '%event-stream%' OR
+        response_body_content_type LIKE '%event-stream%'
+      )
+    ORDER BY id ASC
+    LIMIT ?
+  `);
+  const selectRow = database.prepare(`
+    SELECT
+      path,
+      url,
+      request_headers,
+      response_headers,
+      request_body_text,
+      request_body_encoding,
+      response_body_content_type
+    FROM request_logs
+    WHERE id = ?
+  `);
+  const markStream = database.prepare("UPDATE request_logs SET is_stream = 1 WHERE id = ?");
+  const updateProgress = database.prepare(`
+    UPDATE request_log_schema_migrations
+    SET last_id = ?, updated_at = ?
+    WHERE migration = ?
+  `);
+  let lastId = state.lastId;
+  while (true) {
+    const ids = (selectIds.all(lastId, requestLogMigrationBatchSize) as Record<string, SqlValue>[])
+      .map((row) => normalizeCount(row.id));
+    if (ids.length === 0) {
+      completeRequestLogMigration(database, streamFlagsMigrationName, lastId);
+      return;
+    }
+    database.exec("BEGIN IMMEDIATE");
+    try {
+      for (const id of ids) {
+        // One body in memory at a time.
+        const row = selectRow.get(id) as Record<string, SqlValue> | undefined;
+        if (!row) continue;
+        const requestBodyText = String(row.request_body_encoding ?? "utf8") === "utf8"
+          ? String(row.request_body_text ?? "")
+          : undefined;
+        const isStream = inferRequestLogIsStream({
+          path: String(row.path ?? ""),
+          requestBodyText,
+          requestHeaders: parseHeaderJson(row.request_headers),
+          responseBodyContentType: String(row.response_body_content_type ?? ""),
+          responseHeaders: parseHeaderJson(row.response_headers),
+          url: String(row.url ?? "")
+        });
+        if (isStream) markStream.run(id);
+      }
+      lastId = ids[ids.length - 1]!;
+      updateProgress.run(lastId, Date.now(), streamFlagsMigrationName);
+      database.exec("COMMIT");
+    } catch (error) {
+      if (database.inTransaction) database.exec("ROLLBACK");
+      throw error;
     }
   }
 }
