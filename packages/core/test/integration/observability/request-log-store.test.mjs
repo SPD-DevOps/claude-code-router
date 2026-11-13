@@ -78,6 +78,56 @@ test("RequestLogStore backfills model summaries when upgrading an existing datab
   }
 });
 
+test("RequestLogStore backfills stream flags once, in pages, without rescanning truncated bodies", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "ccr-request-log-stream-flag-migration-test-"));
+  const dbFile = path.join(dir, "request-logs.sqlite");
+  let store;
+  try {
+    // Create the current schema, then seed rows that the old backfill rescanned forever:
+    // non-stream rows whose truncated body mentions "stream" but has no parsable flag.
+    store = new RequestLogStore(dbFile);
+    await store.list({ pageSize: 1 });
+    await store.close();
+    store = undefined;
+
+    const seed = createBetterSqliteDatabase(dbFile);
+    try {
+      seed.prepare("DELETE FROM request_log_schema_migrations WHERE migration = 'stream-flags-v1'").run();
+      const insert = seed.prepare(`
+        INSERT INTO request_logs (created_at, method, path, request_body_text, is_stream)
+        VALUES (?, 'POST', '/v1/messages', ?, 0)
+      `);
+      const now = new Date().toISOString();
+      const truncated = JSON.stringify({ messages: [{ role: "user", content: "stream ".repeat(200) }] }).slice(0, 500);
+      for (let index = 0; index < 1_200; index += 1) insert.run(now, truncated);
+      insert.run(now, JSON.stringify({ model: "m", stream: true }));
+    } finally {
+      seed.close();
+    }
+
+    store = new RequestLogStore(dbFile);
+    await store.list({ pageSize: 1 });
+    await store.close();
+    store = undefined;
+
+    const check = createBetterSqliteDatabase(dbFile);
+    try {
+      const streamed = check.prepare("SELECT COUNT(*) AS total FROM request_logs WHERE is_stream = 1").get();
+      assert.equal(streamed.total, 1);
+      const migration = check.prepare(
+        "SELECT completed, last_id FROM request_log_schema_migrations WHERE migration = 'stream-flags-v1'"
+      ).get();
+      assert.equal(migration.completed, 1);
+      assert.ok(migration.last_id >= 1_201);
+    } finally {
+      check.close();
+    }
+  } finally {
+    await store?.close();
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
 test("RequestLogStore resumes interrupted gateway migrations across bounded batches", async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "ccr-request-log-paged-migration-test-"));
   const dbFile = path.join(dir, "request-logs.sqlite");
@@ -163,7 +213,8 @@ test("RequestLogStore resumes interrupted gateway migrations across bounded batc
       `).all();
       assert.deepEqual(migrations, [
         { completed: 1, migration: "gateway-final-attempt-v1" },
-        { completed: 1, migration: "gateway-outcome-v1" }
+        { completed: 1, migration: "gateway-outcome-v1" },
+        { completed: 1, migration: "stream-flags-v1" }
       ]);
       const indexes = migrated.prepare("PRAGMA index_list(request_logs)").all();
       assert.equal(indexes.some((index) => index.name === "request_logs_request_id_idx"), true);
